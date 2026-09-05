@@ -5,6 +5,8 @@
  * Handles DNS queries for SPF record discovery and parsing
  */
 
+require_once __DIR__ . '/Security.php';
+
 class DNSLookup {
     private $db;
     
@@ -19,6 +21,13 @@ class DNSLookup {
      * @return array Array of TXT record strings
      */
     public function getTXTRecords($domain) {
+        // Validate and sanitize domain
+        $sanitizedDomain = sanitizeDomainForShell($domain);
+        if ($sanitizedDomain === false) {
+            error_log("Invalid domain format: {$domain}");
+            return [];
+        }
+        
         // Check cache first
         $cached = $this->getFromCache($domain, 'TXT');
         if ($cached !== null) {
@@ -27,12 +36,12 @@ class DNSLookup {
         
         $records = [];
         
-        // Try dig first
-        $output = shell_exec("dig +short TXT {$domain} 2>/dev/null");
+        // Try dig first - using escaped argument
+        $output = shell_exec("dig +short TXT {$sanitizedDomain} 2>/dev/null");
         
         if (!$output) {
-            // Fallback to nslookup
-            $output = shell_exec("nslookup -q=TXT {$domain} 2>/dev/null");
+            // Fallback to nslookup - using escaped argument
+            $output = shell_exec("nslookup -q=TXT {$sanitizedDomain} 2>/dev/null");
         }
         
         if ($output) {
