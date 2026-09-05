@@ -227,6 +227,38 @@ function cmdImport($options) {
             }
         }
         
+        // Show direct IP entries
+        if (!empty($result['direct_ips']['ip4'])) {
+            echo "\nImported direct IPv4 addresses:\n";
+            foreach ($result['direct_ips']['ip4'] as $ip4) {
+                echo "  • ip4:{$ip4}\n";
+            }
+        }
+        
+        if (!empty($result['direct_ips']['ip6'])) {
+            echo "\nImported direct IPv6 addresses:\n";
+            foreach ($result['direct_ips']['ip6'] as $ip6) {
+                echo "  • ip6:{$ip6}\n";
+            }
+        }
+        
+        // Warn about A/MX records that need manual attention
+        if ($result['has_a_records']) {
+            echo "\n⚠️  A record mechanisms found (these cause DNS lookups):\n";
+            foreach ($result['a_records'] as $aRecord) {
+                echo "  • {$aRecord}\n";
+            }
+            echo "   These will be resolved during flattening.\n";
+        }
+        
+        if ($result['has_mx_records']) {
+            echo "\n⚠️  MX record mechanisms found (these cause DNS lookups):\n";
+            foreach ($result['mx_records'] as $mxRecord) {
+                echo "  • {$mxRecord}\n";
+            }
+            echo "   These will be resolved during flattening.\n";
+        }
+        
         echo "\nYou can now run: php cli.php flatten --domain={$domainName}\n";
     } else {
         echo "✗ Import failed\n";

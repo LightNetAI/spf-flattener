@@ -871,7 +871,7 @@ while ($row = $sendersStmt->fetch()) {
                 if (result.success) {
                     resultDiv.className = 'import-status success';
                     resultDiv.innerHTML = '<strong>✓ Import successful!</strong><br>' +
-                        'Added ' + result.senders_added + ' sender(s) automatically.<br>' +
+                        (result.import_summary || 'Added ' + result.senders_added + ' sender(s) automatically.') + '<br>' +
                         'Redirecting to domains list...';
                     
                     setTimeout(() => {

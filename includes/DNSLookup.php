@@ -260,6 +260,53 @@ class DNSLookup {
                 }
             }
             
+            // Also import direct ip4: and ip6: entries as "Direct IP" senders
+            // These are static IPs defined directly in the SPF record
+            $directIpSenders = [];
+            
+            // Add IPv4 entries
+            foreach ($mechanisms['ip4'] as $ip4) {
+                $senderKey = "ip4:{$ip4}";
+                if (!in_array($senderKey, $existingIncludes)) {
+                    $directIpSenders[] = [
+                        'name' => "Direct IPv4: {$ip4}",
+                        'domain' => $senderKey
+                    ];
+                }
+            }
+            
+            // Add IPv6 entries
+            foreach ($mechanisms['ip6'] as $ip6) {
+                $senderKey = "ip6:{$ip6}";
+                if (!in_array($senderKey, $existingIncludes)) {
+                    $directIpSenders[] = [
+                        'name' => "Direct IPv6: {$ip6}",
+                        'domain' => $senderKey
+                    ];
+                }
+            }
+            
+            // Insert direct IP senders
+            foreach ($directIpSenders as $directIp) {
+                $stmt = $this->db->prepare("
+                    INSERT INTO approved_senders 
+                    (sending_domain_id, sender_name, include_domain, is_active)
+                    VALUES (?, ?, ?, 1)
+                ");
+                $stmt->execute([$sendingDomainId, $directIp['name'], $directIp['domain']]);
+                $sendersAdded++;
+            }
+            
+            // Also flag if there are A or MX mechanisms that need manual attention
+            $result['has_a_records'] = !empty($mechanisms['a_records']);
+            $result['has_mx_records'] = !empty($mechanisms['mx_records']);
+            $result['a_records'] = $mechanisms['a_records'];
+            $result['mx_records'] = $mechanisms['mx_records'];
+            $result['direct_ips'] = [
+                'ip4' => $mechanisms['ip4'],
+                'ip6' => $mechanisms['ip6']
+            ];
+            
             $result['senders_added'] = $sendersAdded;
             $result['success'] = true;
             

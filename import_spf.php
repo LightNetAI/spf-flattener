@@ -76,6 +76,30 @@ try {
         $dns = new DNSLookup();
         $result = $dns->importSPFForDomain($domainId);
         
+        // Add human-readable message about what was imported
+        if ($result['success']) {
+            $message = "Imported {$result['senders_added']} sender(s): ";
+            $parts = [];
+            
+            if (!empty($result['mechanisms']['includes'])) {
+                $parts[] = count($result['mechanisms']['includes']) . " include(s)";
+            }
+            if (!empty($result['direct_ips']['ip4'])) {
+                $parts[] = count($result['direct_ips']['ip4']) . " IPv4 address(es)";
+            }
+            if (!empty($result['direct_ips']['ip6'])) {
+                $parts[] = count($result['direct_ips']['ip6']) . " IPv6 address(es)";
+            }
+            if ($result['has_a_records']) {
+                $parts[] = "A record(s) - needs manual review";
+            }
+            if ($result['has_mx_records']) {
+                $parts[] = "MX record(s) - needs manual review";
+            }
+            
+            $result['import_summary'] = $message . implode(', ', $parts);
+        }
+        
         echo json_encode($result);
         
     } elseif ($action === 'add_and_import') {
@@ -100,6 +124,30 @@ try {
         // Now import SPF
         $dns = new DNSLookup();
         $importResult = $dns->importSPFForDomain($domainId);
+        
+        // Add summary message
+        if ($importResult['success']) {
+            $message = "Imported {$importResult['senders_added']} sender(s): ";
+            $parts = [];
+            
+            if (!empty($importResult['mechanisms']['includes'])) {
+                $parts[] = count($importResult['mechanisms']['includes']) . " include(s)";
+            }
+            if (!empty($importResult['direct_ips']['ip4'])) {
+                $parts[] = count($importResult['direct_ips']['ip4']) . " IPv4 address(es)";
+            }
+            if (!empty($importResult['direct_ips']['ip6'])) {
+                $parts[] = count($importResult['direct_ips']['ip6']) . " IPv6 address(es)";
+            }
+            if ($importResult['has_a_records']) {
+                $parts[] = "A record(s)";
+            }
+            if ($importResult['has_mx_records']) {
+                $parts[] = "MX record(s)";
+            }
+            
+            $importResult['import_summary'] = $message . implode(', ', $parts);
+        }
         
         echo json_encode(array_merge([
             'domain_id' => $domainId,
