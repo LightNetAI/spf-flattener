@@ -1,0 +1,51 @@
+# SPF Flattener Git Ignore
+
+# Configuration files with secrets
+config/config.local.php
+config/*.local.php
+
+# Logs
+logs/*.log
+logs/cron.log
+*.log
+
+# Database files
+*.sqlite
+*.db
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Composer dependencies (if using composer)
+vendor/
+
+# Node modules (if any frontend build)
+node_modules/
+
+# Build artifacts
+*.tar.gz
+*.zip
+build/
+dist/
+
+# Cache files
+cache/
+*.cache
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Uploaded files (if any)
+uploads/
