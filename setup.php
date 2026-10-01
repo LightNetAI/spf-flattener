@@ -12,6 +12,13 @@
 require_once __DIR__ . '/config/config.php';
 require_once __DIR__ . '/includes/Security.php';
 require_once __DIR__ . '/includes/Setup.php';
+require_once __DIR__ . '/includes/Auth.php';
+
+// Start the session BEFORE any output. generateCSRFToken() would otherwise
+// call session_start() mid-page, by which point headers are already sent and
+// the session cookie is silently dropped — making every request a new session
+// and breaking CSRF validation.
+Auth::startSession();
 
 // If we are already installed, get out of the way.
 if (Setup::isInstalled() && !isset($_GET['restart'])) {
@@ -42,6 +49,16 @@ $prefill  = [
 ];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // The installer runs before a database exists, so this is a plain
+    // session-backed CSRF check.
+    if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+        $errors[] = 'Your session expired. Please reload the page and try again.';
+        $step = 'database';
+        $_POST = [];
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && empty($errors)) {
     $prefill['host'] = trim($_POST['db_host'] ?? $prefill['host']);
     $prefill['port'] = (int) ($_POST['db_port'] ?? $prefill['port']);
     $prefill['user'] = trim($_POST['db_user'] ?? $prefill['user']);
@@ -158,6 +175,36 @@ $brandColour = '#0079b8';
         background: #fff; padding: 1px 5px; border-radius: 4px;
         border: 1px solid var(--border); color: var(--blue-dark);
       }
+
+      /* Password field with a show/hide control */
+      .input-with-toggle { position: relative; }
+      .input-with-toggle .form-input { padding-right: 68px; }
+      .input-toggle {
+        position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+        padding: 6px 10px; border-radius: 6px;
+        font-size: 12px; font-weight: 600; color: var(--blue);
+        background: transparent; border: none;
+        transition: background var(--transition), color var(--transition);
+      }
+      .input-toggle:hover { background: var(--blue-light); color: var(--blue-dark); }
+
+      /* Live password policy checklist */
+      .pw-policy { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 5px; }
+      .pw-policy li {
+        position: relative; padding-left: 22px;
+        font-size: 12px; color: var(--muted); line-height: 1.5;
+        transition: color var(--transition);
+      }
+      .pw-policy li::before {
+        content: '○'; position: absolute; left: 4px; top: -1px;
+        font-size: 12px; color: #c3ced8;
+        transition: color var(--transition);
+      }
+      .pw-policy li.ok { color: var(--ok); }
+      .pw-policy li.ok::before { content: '✓'; color: var(--ok); font-weight: 700; }
+
+      .form-hint.pw-ok  { color: var(--ok); font-weight: 600; }
+      .form-hint.pw-bad { color: var(--danger); font-weight: 600; }
     </style>
 </head>
 <body>
@@ -199,6 +246,7 @@ $brandColour = '#0079b8';
 
       <form method="post" autocomplete="off">
         <input type="hidden" name="step" value="database">
+        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(generateCSRFToken()) ?>">
 
         <div class="form-row">
           <div class="form-group">
@@ -256,38 +304,126 @@ $brandColour = '#0079b8';
         to sign in; every action is written to the audit log against this username.
       </div>
 
-      <form method="post" autocomplete="off">
+      <form method="post" autocomplete="off" id="adminForm">
         <input type="hidden" name="step" value="admin">
+        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(generateCSRFToken()) ?>">
 
         <div class="form-row">
           <div class="form-group">
             <label class="form-label" for="admin_user">Username <span class="req">*</span></label>
             <input class="form-input" type="text" id="admin_user" name="admin_user"
                    value="<?= htmlspecialchars($_POST['admin_user'] ?? 'admin') ?>" required
-                   pattern="[a-zA-Z0-9._-]{3,64}">
+                   pattern="[a-zA-Z0-9._-]{3,64}" autocomplete="username">
+            <div class="form-hint">3–64 characters: letters, numbers, dot, dash or underscore.</div>
           </div>
           <div class="form-group">
             <label class="form-label" for="admin_email">Email</label>
             <input class="form-input" type="email" id="admin_email" name="admin_email"
-                   value="<?= htmlspecialchars($_POST['admin_email'] ?? '') ?>">
+                   value="<?= htmlspecialchars($_POST['admin_email'] ?? '') ?>"
+                   autocomplete="email">
+            <div class="form-hint">Optional — used for change notifications.</div>
           </div>
         </div>
 
         <div class="form-group">
           <label class="form-label" for="admin_pass">Password <span class="req">*</span></label>
-          <input class="form-input" type="password" id="admin_pass" name="admin_pass" required
-                 autocomplete="new-password" maxlength="200">
-          <div class="form-hint">At least 10 characters, with an uppercase letter, a lowercase letter, a number and a symbol.</div>
+          <div class="input-with-toggle">
+            <input class="form-input" type="password" id="admin_pass" name="admin_pass" required
+                   autocomplete="new-password" maxlength="200" aria-describedby="pwPolicy">
+            <button type="button" class="input-toggle" id="pwToggle"
+                    aria-label="Show password">Show</button>
+          </div>
+
+          <ul class="pw-policy" id="pwPolicy">
+            <li data-rule="len">At least 10 characters</li>
+            <li data-rule="upper">An uppercase letter</li>
+            <li data-rule="lower">A lowercase letter</li>
+            <li data-rule="digit">A number</li>
+            <li data-rule="symbol">A symbol</li>
+          </ul>
         </div>
 
         <div class="form-group">
           <label class="form-label" for="admin_pass2">Confirm Password <span class="req">*</span></label>
           <input class="form-input" type="password" id="admin_pass2" name="admin_pass2" required
                  autocomplete="new-password" maxlength="200">
+          <div class="form-hint" id="pwMatchHint"></div>
         </div>
 
-        <button class="btn btn-primary btn-block" type="submit">Create Administrator &amp; Sign In</button>
+        <button class="btn btn-primary btn-block" type="submit" id="createBtn"
+                <?= ($_POST['step'] ?? '') === 'admin' && empty($errors) ? '' : '' ?>>
+          Create Administrator &amp; Sign In
+        </button>
       </form>
+
+      <script>
+      (function () {
+        var pw      = document.getElementById('admin_pass');
+        var pw2     = document.getElementById('admin_pass2');
+        var toggle  = document.getElementById('pwToggle');
+        var hint    = document.getElementById('pwMatchHint');
+        var btn     = document.getElementById('createBtn');
+        if (!pw) return;
+
+        var rules = {
+          len:    function (v) { return v.length >= 10; },
+          upper:  function (v) { return /[A-Z]/.test(v); },
+          lower:  function (v) { return /[a-z]/.test(v); },
+          digit:  function (v) { return /[0-9]/.test(v); },
+          symbol: function (v) { return /[^A-Za-z0-9]/.test(v); }
+        };
+
+        function evaluate() {
+          var v = pw.value;
+          var allOk = true;
+
+          Object.keys(rules).forEach(function (key) {
+            var li = document.querySelector('[data-rule="' + key + '"]');
+            if (!li) return;
+            var ok = rules[key](v);
+            li.classList.toggle('ok', ok && v !== '');
+            if (!ok) allOk = false;
+          });
+
+          // Confirm-field feedback
+          if (pw2.value === '') {
+            hint.textContent = '';
+            hint.className = 'form-hint';
+          } else if (pw2.value === v) {
+            hint.textContent = 'Passwords match.';
+            hint.className = 'form-hint pw-ok';
+          } else {
+            hint.textContent = 'Passwords do not match.';
+            hint.className = 'form-hint pw-bad';
+          }
+
+          return allOk && v === pw2.value && v !== '';
+        }
+
+        pw.addEventListener('input', evaluate);
+        pw2.addEventListener('input', evaluate);
+
+        toggle.addEventListener('click', function () {
+          var showing = pw.type === 'text';
+          pw.type = showing ? 'password' : 'text';
+          pw2.type = showing ? 'password' : 'text';
+          toggle.textContent = showing ? 'Show' : 'Hide';
+          toggle.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+        });
+
+        // Block submission only when the browser would otherwise let it through
+        document.getElementById('adminForm').addEventListener('submit', function (e) {
+          if (!evaluate()) {
+            e.preventDefault();
+            if (pw.value !== pw2.value) {
+              hint.textContent = 'Passwords do not match.';
+              hint.className = 'form-hint pw-bad';
+            }
+            pw.focus();
+          }
+        });
+      })();
+      </script>
 
     <?php endif; ?>
 

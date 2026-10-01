@@ -88,7 +88,14 @@ Just open the application in a browser. If no working database is found,
 4. **Imports the schema** (all 11 tables) using PDO, so no `mysql` CLI
    access is needed on the host
 5. **Writes `config/config.local.php`** with mode `640`
-6. Asks for the first administrator account, then signs you in
+6. **Asks for the administrator username, email and password**, then signs
+   you in
+
+The password is enforced on the server against the same policy the rest of
+the application uses, and the form shows a live checklist (length, upper,
+lower, digit, symbol) with a show/hide toggle and confirm-match feedback.
+It is hashed with Argon2id before storage — never written to the database or
+to the config file in plaintext.
 
 The installer is idempotent: re-running it against an existing database
 skips work that is already done. It also resumes at the administrator step
@@ -106,11 +113,12 @@ chmod 775 config
 git clone https://github.com/LightNetAI/spf-flattener.git
 cd spf-flattener
 chmod +x install.sh
-./install.sh
+./install.sh          # thin wrapper — equivalent to: php install.php
 ```
 
-Does the same work from the shell and additionally offers to install the
-cron job.
+Prompts for the same details, including the administrator password (with
+confirmation and the same policy check), and additionally offers to install
+the cron job.
 
 ### Manual
 

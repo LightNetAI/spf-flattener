@@ -285,8 +285,12 @@ class Setup {
                 continue;
             }
 
-            // The dump targets a hard-coded database name; retarget it.
-            $trimmed = preg_replace('/^USE\s+`?[A-Za-z0-9_]+`?\s*;?/i', 'USE `' . $dbName . '`', $trimmed);
+            // The dump contains "USE <name>". Executing it would redirect the
+            // import into the shipped default database rather than the one the
+            // operator chose, so drop it.
+            if (preg_match('/^\s*USE\s+/i', $trimmed)) {
+                continue;
+            }
 
             try {
                 $pdo->exec($trimmed);
