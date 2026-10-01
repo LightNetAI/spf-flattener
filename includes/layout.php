@@ -134,9 +134,25 @@ function renderFooter($extra = null) {
 }
 
 /**
+ * Cache-busting version for a static asset.
+ *
+ * Uses the file's modification time so a browser picks up a changed asset
+ * without the user having to hard-refresh. Falls back to APP_VERSION if the
+ * file cannot be stat()ed.
+ */
+function assetVersion($relativePath) {
+    $full = BASE_PATH . '/' . ltrim($relativePath, '/');
+    if (is_file($full)) {
+        return (string) filemtime($full);
+    }
+    return defined('APP_VERSION') ? APP_VERSION : '1';
+}
+
+/**
  * Shared page <head>.
  */
 function renderHead($title) {
+    $css = 'assets/css/app.css';
     ?>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -146,7 +162,7 @@ function renderHead($title) {
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="assets/css/app.css">
+    <link rel="stylesheet" href="<?= htmlspecialchars($css . '?v=' . assetVersion($css)) ?>">
     <?php
 }
 
@@ -155,7 +171,8 @@ function renderHead($title) {
  * specific logic is added inline by the individual views.
  */
 function renderScripts() {
+    $js = 'assets/js/app.js';
     ?>
-    <script src="assets/js/app.js"></script>
+    <script src="<?= htmlspecialchars($js . '?v=' . assetVersion($js)) ?>"></script>
     <?php
 }

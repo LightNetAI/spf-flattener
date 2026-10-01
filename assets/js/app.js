@@ -150,9 +150,9 @@
 
     // Bring the panel into view, since a hidden element cannot be scrolled to.
     var panel = document.getElementById(tabId);
-    if (panel) {
+    if (panel && typeof panel.scrollIntoView === 'function') {
       try { panel.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
-      catch (e) { panel.scrollIntoView(); }
+      catch (e) { try { panel.scrollIntoView(); } catch (e2) { /* ignore */ } }
     }
   }
 
