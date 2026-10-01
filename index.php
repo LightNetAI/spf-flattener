@@ -9,10 +9,17 @@ require_once __DIR__ . '/includes/Database.php';
 require_once __DIR__ . '/includes/Security.php';
 require_once __DIR__ . '/includes/Auth.php';
 require_once __DIR__ . '/includes/layout.php';
+require_once __DIR__ . '/includes/Setup.php';
 require_once __DIR__ . '/includes/SPFFlattener.php';
 require_once __DIR__ . '/includes/CloudflareAPI.php';
 require_once __DIR__ . '/includes/EmailNotifier.php';
 require_once __DIR__ . '/includes/DNSLookup.php';
+
+// First run, or the database is unreachable: run the installer.
+if (!Setup::isInstalled()) {
+    header('Location: setup.php');
+    exit;
+}
 
 Auth::startSession();
 $auth = new Auth();
@@ -70,7 +77,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($import) {
             $dns = new DNSLookup();
-            $res = $dns->importSPFForDomain($domainId);
+            $res = $dns->importSPFForDomain($domainId, $user['username'], 'import');
             if ($res['success']) {
                 $auth->auditCurrent('SPF_IMPORTED',
                     "Imported {$res['senders_added']} sender(s) for {$domain}", $domain);
@@ -264,7 +271,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 $domains = $db->query("
     SELECT d.*,
            (SELECT COUNT(*) FROM sending_domains sd WHERE sd.domain_id = d.id) AS sender_count,
-           (SELECT COUNT(*) FROM flattened_ips fi WHERE fi.domain_id = d.id AND fi.is_active = 1) AS ip_count
+           (SELECT COUNT(*) FROM flattened_ips fi WHERE fi.domain_id = d.id AND fi.is_active = 1) AS ip_count,
+           (SELECT COUNT(*) FROM spf_records sr WHERE sr.domain_id = d.id) AS record_count
       FROM domains d
      ORDER BY d.created_at DESC
 ")->fetchAll();
@@ -372,7 +380,12 @@ $csrf          = generateCSRFToken();
               <?php foreach ($domains as $d): ?>
                 <tr>
                   <td>
-                    <strong><?= htmlspecialchars($d['domain']) ?></strong><br>
+                    <a class="domain-link" href="domain.php?id=<?= (int) $d['id'] ?>">
+                      <?= htmlspecialchars($d['domain']) ?>
+                    </a>
+                    <span class="badge badge-neutral" title="Imported SPF record snapshots on file">
+                      <?= (int) $d['record_count'] ?> record<?= (int) $d['record_count'] === 1 ? '' : 's' ?>
+                    </span><br>
                     <?php if ($d['cloudflare_zone_id']): ?>
                       <span class="badge badge-info">Cloudflare</span>
                     <?php endif; ?>

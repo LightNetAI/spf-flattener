@@ -6,8 +6,21 @@
 require_once __DIR__ . '/config/config.php';
 require_once __DIR__ . '/includes/Database.php';
 require_once __DIR__ . '/includes/Security.php';
+require_once __DIR__ . '/includes/Setup.php';
 require_once __DIR__ . '/includes/Auth.php';
 require_once __DIR__ . '/includes/DNSLookup.php';
+
+// Not installed yet? Send the user to the installer.
+if (!Setup::isInstalled()) {
+    if (basename($_SERVER['SCRIPT_NAME'] ?? '') === 'import_spf.php') {
+        header('Content-Type: application/json');
+        http_response_code(503);
+        echo json_encode(['success' => false, 'error' => 'The application is not installed yet.']);
+        exit;
+    }
+    header('Location: setup.php');
+    exit;
+}
 
 header('Content-Type: application/json');
 
@@ -102,7 +115,7 @@ try {
         }
 
         $dns = new DNSLookup();
-        $res = $dns->importSPFForDomain($domainId);
+        $res = $dns->importSPFForDomain($domainId, $user['username'], 'import');
 
         if ($res['success']) {
             $parts = [];

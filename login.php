@@ -7,7 +7,14 @@ require_once __DIR__ . '/config/config.php';
 require_once __DIR__ . '/includes/Database.php';
 require_once __DIR__ . '/includes/Security.php';
 require_once __DIR__ . '/includes/Auth.php';
+require_once __DIR__ . '/includes/Setup.php';
 require_once __DIR__ . '/includes/layout.php';
+
+// Not installed yet? Send the user to the installer.
+if (!Setup::isInstalled()) {
+    header('Location: setup.php');
+    exit;
+}
 
 Auth::startSession();
 $auth = new Auth();

@@ -20,6 +20,7 @@ require_once __DIR__ . '/../includes/Auth.php';
 require_once __DIR__ . '/../includes/SPFFlattener.php';
 require_once __DIR__ . '/../includes/CloudflareAPI.php';
 require_once __DIR__ . '/../includes/EmailNotifier.php';
+require_once __DIR__ . '/../includes/DNSLookup.php';
 
 // Parse command line options
 $options = getopt('', ['no-email', 'force']);

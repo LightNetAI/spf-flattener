@@ -74,6 +74,10 @@ switch ($command) {
     case 'dns-test':
         cmdDNSTest($options);
         break;
+
+    case 'records':
+        cmdRecords($options);
+        break;
     
     case 'config':
         cmdConfig($options);
@@ -253,12 +257,15 @@ function cmdImport($options) {
     echo str_repeat('-', 60) . "\n\n";
     
     // Parse and import
-    $result = $dns->importSPFForDomain($domainId);
+    $result = $dns->importSPFForDomain($domainId, 'cli', 'import');
     
     if ($result['success']) {
         echo "✓ Import successful!\n\n";
         echo "Senders added: {$result['senders_added']}\n";
         echo "Includes found: {$result['includes_found']}\n";
+        if (!empty($result['snapshot_id'])) {
+            echo "Snapshot saved: #{$result['snapshot_id']} (review with: php cli.php records --domain={$domainName})\n";
+        }
         
         if (!empty($result['mechanisms']['includes'])) {
             echo "\nImported include mechanisms:\n";
@@ -437,6 +444,63 @@ function cmdConfig($options) {
     }
 }
 
+/**
+ * Show the stored original SPF record snapshots for a domain.
+ */
+function cmdRecords($options) {
+    global $db, $dns;
+
+    $domainName = $options['domain'] ?? null;
+    if (!$domainName) {
+        echo "Error: --domain is required\n";
+        echo "Usage: php cli.php records --domain=example.com\n";
+        exit(1);
+    }
+
+    $stmt = $db->prepare("SELECT id FROM domains WHERE domain = ?");
+    $stmt->execute([$domainName]);
+    $domainId = $stmt->fetchColumn();
+
+    if (!$domainId) {
+        echo "Error: Domain '{$domainName}' not found\n";
+        exit(1);
+    }
+
+    $history = $dns->getRecordHistory($domainId, 100);
+
+    if (empty($history)) {
+        echo "No SPF records have been captured for {$domainName} yet.\n";
+        echo "Run: php cli.php import --domain={$domainName}\n";
+        return;
+    }
+
+    echo "\nOriginal SPF records captured for {$domainName} (" . count($history) . "):\n";
+    echo str_repeat('=', 78) . "\n";
+
+    foreach ($history as $i => $snap) {
+        $when = date('Y-m-d H:i:s', strtotime($snap['created_at']));
+        $who  = $snap['imported_by'] ?: 'automatic';
+        $tag  = $i === 0 ? ' [most recent]' : ($i === count($history) - 1 && count($history) > 1 ? ' [original import]' : '');
+
+        echo "\n{$when}{$tag}\n";
+        echo "  source: {$snap['source']}   imported by: {$who}   lookups: {$snap['lookup_count']}\n";
+        echo "  {$snap['spf_record']}\n";
+
+        $mech = $snap['mechanisms_parsed'];
+        $bits = [];
+        foreach (['includes' => 'include', 'ip4' => 'ip4', 'ip6' => 'ip6'] as $k => $label) {
+            if (!empty($mech[$k])) {
+                $bits[] = count($mech[$k]) . " {$label}";
+            }
+        }
+        if (!empty($bits)) {
+            echo '  mechanisms: ' . implode(', ', $bits) . "\n";
+        }
+    }
+
+    echo "\n" . str_repeat('=', 78) . "\n";
+}
+
 function cmdUserAdd($options) {
     $auth = new Auth();
 
@@ -601,6 +665,7 @@ function showHelp() {
     echo "  check        Check for SPF changes\n";
     echo "  list         List all configured domains\n";
     echo "  import       Import SPF record from DNS\n";
+    echo "  records      Show stored original SPF records\n";
     echo "  dns-test     Test DNS lookup (debug)\n";
     echo "  config       View or set application configuration\n";
     echo "  user:add     Create a user account\n";

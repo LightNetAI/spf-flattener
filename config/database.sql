@@ -170,3 +170,25 @@ CREATE TABLE IF NOT EXISTS dns_cache (
     UNIQUE KEY unique_query (query_domain, query_type),
     INDEX idx_expires (expires_at)
 );
+
+-- ============================================================
+-- Imported SPF record history
+--
+-- Every import stores a snapshot, so the record as it was
+-- originally published can be reviewed after it is flattened
+-- or superseded. Nothing here is ever overwritten.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS spf_records (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    domain_id INT NOT NULL,
+    spf_record TEXT NOT NULL,
+    txt_records TEXT,                                  -- JSON array: every TXT record seen
+    mechanisms TEXT,                                   -- JSON: parsed include/ip4/ip6/a/mx
+    lookup_count INT DEFAULT 0,
+    source ENUM('import', 'reimport', 'cron', 'manual') DEFAULT 'import',
+    imported_by VARCHAR(64) DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (domain_id) REFERENCES domains(id) ON DELETE CASCADE,
+    INDEX idx_domain_created (domain_id, created_at),
+    INDEX idx_domain (domain_id)
+);

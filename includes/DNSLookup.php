@@ -183,14 +183,20 @@ class DNSLookup {
      * include: mechanism AND per direct ip4:/ip6: entry, so the flattener
      * reproduces the original authorisation set exactly.
      *
-     * @param int $domainId
+     * A snapshot of the record as published is appended to spf_records so
+     * it can be reviewed later, after flattening has superseded it.
+     *
+     * @param int    $domainId
+     * @param string $importedBy  Username to attribute the snapshot to
+     * @param string $source      import | reimport | cron | manual
      * @return array
      */
-    public function importSPFForDomain($domainId) {
+    public function importSPFForDomain($domainId, $importedBy = null, $source = 'import') {
         $result = [
             'success'        => false,
             'domain_id'      => $domainId,
             'spf_record'     => '',
+            'txt_records'    => [],
             'mechanisms'     => [],
             'includes_found' => 0,
             'senders_added'  => 0,
@@ -199,6 +205,7 @@ class DNSLookup {
             'has_mx_records' => false,
             'a_records'      => [],
             'mx_records'     => [],
+            'snapshot_id'    => null,
             'errors'         => [],
         ];
 
@@ -212,7 +219,18 @@ class DNSLookup {
                 return $result;
             }
 
-            $spfRecord = $this->getSPFRecord($domain);
+            // All TXT records, so the review page can show what else the
+            // domain publishes alongside its SPF policy.
+            $txtRecords = $this->getTXTRecords($domain);
+            $result['txt_records'] = $txtRecords;
+
+            $spfRecord = '';
+            foreach ($txtRecords as $record) {
+                if (stripos(trim($record), 'v=spf1') === 0) {
+                    $spfRecord = trim($record);
+                    break;
+                }
+            }
 
             if (empty($spfRecord)) {
                 $result['errors'][] = "No SPF record found for {$domain}.";
@@ -233,6 +251,8 @@ class DNSLookup {
                 'ip6' => $mechanisms['ip6'],
             ];
 
+            $lookupCount = $this->countLookups($spfRecord);
+
             // Persist the original record and its lookup count.
             $stmt = $this->db->prepare("
                 UPDATE domains
@@ -240,7 +260,18 @@ class DNSLookup {
                        lookup_count_before = ?
                  WHERE id = ?
             ");
-            $stmt->execute([$spfRecord, $this->countLookups($spfRecord), $domainId]);
+            $stmt->execute([$spfRecord, $lookupCount, $domainId]);
+
+            // Append a reviewable snapshot.
+            $result['snapshot_id'] = $this->saveRecordSnapshot(
+                $domainId,
+                $spfRecord,
+                $txtRecords,
+                $mechanisms,
+                $lookupCount,
+                $importedBy,
+                $source
+            );
 
             // Ensure a sending-domain row exists for the apex.
             $stmt = $this->db->prepare("
@@ -374,6 +405,89 @@ class DNSLookup {
         $parts = explode('.', $includeDomain);
         $name = ucfirst(preg_replace('/[^a-z0-9]/i', '', $parts[0]));
         return ($name !== '' && strlen($name) > 1) ? $name . " ({$includeDomain})" : $includeDomain;
+    }
+
+    /* ========================================================
+     * Record history
+     * ====================================================== */
+
+    /**
+     * Append an SPF record snapshot for later review.
+     *
+     * A snapshot is only written when the record differs from the most
+     * recent one, so repeated imports do not create noise.
+     *
+     * @return int|null The new snapshot id, or the existing one if unchanged
+     */
+    private function saveRecordSnapshot($domainId, $spfRecord, $txtRecords, $mechanisms, $lookupCount, $importedBy, $source) {
+        try {
+            // Skip if this is identical to the newest stored snapshot.
+            $stmt = $this->db->prepare("
+                SELECT id, spf_record FROM spf_records
+                 WHERE domain_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
+            ");
+            $stmt->execute([$domainId]);
+            $last = $stmt->fetch();
+
+            if ($last && trim($last['spf_record']) === trim($spfRecord)) {
+                return (int) $last['id'];
+            }
+
+            $stmt = $this->db->prepare("
+                INSERT INTO spf_records
+                    (domain_id, spf_record, txt_records, mechanisms, lookup_count, source, imported_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ");
+            $stmt->execute([
+                $domainId,
+                $spfRecord,
+                json_encode(array_values($txtRecords), JSON_UNESCAPED_SLASHES),
+                json_encode($mechanisms, JSON_UNESCAPED_SLASHES),
+                $lookupCount,
+                in_array($source, ['import', 'reimport', 'cron', 'manual'], true) ? $source : 'import',
+                $importedBy ? substr((string) $importedBy, 0, 64) : null,
+            ]);
+
+            return (int) $this->db->lastInsertId();
+        } catch (Throwable $e) {
+            error_log('SPF snapshot write failed: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Every stored snapshot for a domain, newest first.
+     */
+    public function getRecordHistory($domainId, $limit = 100) {
+        $limit = max(1, min(500, (int) $limit));
+        $stmt = $this->db->prepare("
+            SELECT * FROM spf_records
+             WHERE domain_id = ?
+             ORDER BY created_at DESC, id DESC
+             LIMIT {$limit}
+        ");
+        $stmt->execute([$domainId]);
+
+        $rows = $stmt->fetchAll();
+        foreach ($rows as &$row) {
+            $row['txt_records_list'] = json_decode($row['txt_records'] ?? '[]', true) ?: [];
+            $row['mechanisms_parsed'] = json_decode($row['mechanisms'] ?? '{}', true) ?: [];
+        }
+        return $rows;
+    }
+
+    /**
+     * The most recent snapshot for a domain.
+     */
+    public function getLatestRecord($domainId) {
+        $history = $this->getRecordHistory($domainId, 1);
+        return $history[0] ?? null;
+    }
+
+    public function countRecordHistory($domainId) {
+        $stmt = $this->db->prepare("SELECT COUNT(*) FROM spf_records WHERE domain_id = ?");
+        $stmt->execute([$domainId]);
+        return (int) $stmt->fetchColumn();
     }
 
     /* ========================================================

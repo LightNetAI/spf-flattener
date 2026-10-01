@@ -24,6 +24,21 @@ branded web GUI with username / password authentication.
 - Reconstructs multi-chunk TXT records correctly
 - Recognises common senders (Google, Microsoft 365, SendGrid, Mailchimp…)
 
+**Record history**
+- Every import stores an immutable snapshot of the record as published,
+  together with every TXT record seen and the parsed mechanisms
+- Identical re-imports do not create duplicates
+- The domain name on the dashboard links to a detail page listing every
+  snapshot, so the original policy stays reviewable after flattening has
+  superseded it
+- `php cli.php records --domain=example.com` prints the same history
+
+**Guided installation**
+- Opening the app without a working database redirects to a web installer
+- Collects host, port, username, password and database name, creates the
+  database, imports the schema and writes `config/config.local.php`
+- Finishes by creating the first administrator account
+
 **Authentication & accountability**
 - Username / password sign-in with Argon2id (bcrypt fallback) hashing
 - Brute-force lockout after 5 failed attempts (15 minutes)
@@ -61,27 +76,43 @@ branded web GUI with username / password authentication.
 
 ## Installation
 
+### Web installer (recommended)
+
+Just open the application in a browser. If no working database is found,
+`index.php` redirects to `setup.php`, which:
+
+1. Asks for the database **host, port, username, password and name**
+2. Verifies the connection — a wrong password produces a readable error
+   rather than a stack trace
+3. **Creates the database** if it does not already exist
+4. **Imports the schema** (all 11 tables) using PDO, so no `mysql` CLI
+   access is needed on the host
+5. **Writes `config/config.local.php`** with mode `640`
+6. Asks for the first administrator account, then signs you in
+
+The installer is idempotent: re-running it against an existing database
+skips work that is already done. It also resumes at the administrator step
+if the database was configured but no account exists yet.
+
+`config/` must be writable by the web server:
+
 ```bash
-cd /var/www/html
+chmod 775 config
+```
+
+### Command line installer
+
+```bash
 git clone https://github.com/LightNetAI/spf-flattener.git
 cd spf-flattener
 chmod +x install.sh
 ./install.sh
 ```
 
-The installer:
+Does the same work from the shell and additionally offers to install the
+cron job.
 
-1. Verifies PHP, `pdo_mysql`, the MySQL client and `dig`
-2. Creates the database and imports the schema (including the `users` and
-   `audit_log` tables)
-3. Writes `config/config.local.php` (mode 640) with your credentials
-4. **Creates the first administrator account** — you are prompted for the
-   username and password
-5. Optionally installs the cron job
-
-Then open the app and sign in with the account you just created.
-
-### Manual installation
+### Manual
 
 ```bash
 mysql -u root -p < config/database.sql
@@ -135,6 +166,7 @@ php cli.php import  --domain=example.com     Import SPF from DNS
 php cli.php import  --domain=new.com --add   Import, creating the domain first
 php cli.php list                             List configured domains
 php cli.php dns-test --domain=google.com     Diagnose DNS lookups
+php cli.php records --domain=example.com     Original SPF records captured
 php cli.php config  --set key=value          Read or write settings
 php cli.php user:add --username=admin        Create an account
 php cli.php user:list                        List accounts
@@ -255,6 +287,7 @@ See `SECURITY_AUDIT.md` for the full assessment.
 | `change_log`      | Detected IP additions / removals                |
 | `email_queue`     | Pending notifications                           |
 | `dns_cache`       | Cached DNS answers                              |
+| `spf_records`     | Immutable snapshots of every imported record    |
 
 ---
 

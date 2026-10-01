@@ -331,6 +331,15 @@ table.data tbody tr:last-child td { border-bottom: none; }
 .row--inactive { opacity: 0.5; }
 .cell-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 
+/* Clickable domain name in the domains table */
+.domain-link {
+  font-size: 15px; font-weight: 700; color: var(--blue);
+  border-bottom: 1px solid transparent;
+  transition: color var(--transition), border-color var(--transition);
+}
+.domain-link:hover { color: var(--cyan); border-bottom-color: var(--cyan); }
+.domain-link::after { content: ' ↗'; font-size: 11px; opacity: 0.5; }
+
 /* 14. Badges
    ========================================================== */
 .badge {
