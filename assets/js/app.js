@@ -104,20 +104,62 @@
   })();
 
   /* ---- Tabs ------------------------------------------------ */
+  // Maps a URL fragment to the tab content it should reveal. The nav links
+  // and the post-action redirects use these short hashes, which did not match
+  // any element id, so clicking them appeared to do nothing.
+  var TAB_HASH_MAP = {
+    'domains': 'tab-domains',
+    'add':     'tab-add',
+    'senders': 'tab-senders',
+    'config':  'tab-config'
+  };
+
   window.showTab = function (tabId, el) {
+    var target = document.getElementById(tabId);
+    if (!target) return;
+
     document.querySelectorAll('.tab').forEach(function (t) { t.classList.remove('active'); });
     document.querySelectorAll('.tab-content').forEach(function (c) { c.classList.remove('active'); });
 
     if (el) {
       el.classList.add('active');
     } else {
-      var first = document.querySelector('.tab');
-      if (first) first.classList.add('active');
+      // Match the tab button to the panel by its onclick target.
+      var match = null;
+      document.querySelectorAll('.tab').forEach(function (t) {
+        var attr = t.getAttribute('onclick') || '';
+        if (attr.indexOf("'" + tabId + "'") !== -1) match = t;
+      });
+      if (match) match.classList.add('active');
     }
 
-    var target = document.getElementById(tabId);
-    if (target) target.classList.add('active');
+    target.classList.add('active');
   };
+
+  /**
+   * Reveal the tab named by the current URL fragment.
+   */
+  function activateTabFromHash() {
+    var hash = (window.location.hash || '').replace(/^#/, '').toLowerCase();
+    if (!hash) return;
+
+    var tabId = TAB_HASH_MAP[hash] || (hash.indexOf('tab-') === 0 ? hash : null);
+    if (!tabId) return;
+
+    window.showTab(tabId, null);
+
+    // Bring the panel into view, since a hidden element cannot be scrolled to.
+    var panel = document.getElementById(tabId);
+    if (panel) {
+      try { panel.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+      catch (e) { panel.scrollIntoView(); }
+    }
+  }
+
+  window.activateTabFromHash = activateTabFromHash;
+
+  document.addEventListener('DOMContentLoaded', activateTabFromHash);
+  window.addEventListener('hashchange', activateTabFromHash);
 
   /* ---- Collapsibles ---------------------------------------- */
   window.toggleCollapse = function (el) {
