@@ -120,6 +120,7 @@ try {
         }
 
         // Link the zone id when possible so publishing needs no extra step.
+        // A failure here must not abort the import.
         $zoneNote = '';
         if ($zone !== '') {
             try {
@@ -127,8 +128,10 @@ try {
                 $zoneId = $cf->getZoneId($zone);
                 $u = $db->prepare("UPDATE domains SET cloudflare_zone_id = ? WHERE id = ?");
                 $u->execute([$zoneId, $domainId]);
-            } catch (Exception $e) {
-                $zoneNote = " (Cloudflare zone '{$zone}' not found: " . $e->getMessage() . ')';
+            } catch (Throwable $e) {
+                error_log("Cloudflare zone lookup failed for {$zone}: " . $e->getMessage());
+                $zoneNote = " The Cloudflare zone '{$zone}' was not linked: " . $e->getMessage();
+                $auth->auditCurrent('CLOUDFLARE_ZONE_LOOKUP_FAILED', $e->getMessage(), $zone);
             }
         }
 
@@ -167,6 +170,11 @@ try {
 
 } catch (Exception $e) {
     error_log('import_spf.php error: ' . $e->getMessage());
+    http_response_code(500);
+    echo json_encode(['success' => false, 'error' => 'An internal error occurred.']);
+} catch (Throwable $e) {
+    // Deprecations and fatal errors must not produce a 200 with HTML.
+    error_log('import_spf.php fatal: ' . $e->getMessage());
     http_response_code(500);
     echo json_encode(['success' => false, 'error' => 'An internal error occurred.']);
 }

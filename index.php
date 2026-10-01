@@ -79,16 +79,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         // Resolve the Cloudflare zone id so publishing works without a
-        // separate configuration step.
+        // separate configuration step. Failure here must never prevent the
+        // domain being added — it is a convenience lookup, not a requirement.
+        $zoneNote = '';
         if ($zone !== '') {
             try {
                 $cf = new CloudflareAPI();
                 $zoneId = $cf->getZoneId($zone);
                 $u = $db->prepare("UPDATE domains SET cloudflare_zone_id = ? WHERE id = ?");
                 $u->execute([$zoneId, $domainId]);
-            } catch (Exception $e) {
-                setFlash("Saved {$domain}, but the Cloudflare zone '{$zone}' could not be found: "
-                       . $e->getMessage(), 'warning');
+            } catch (Throwable $e) {
+                error_log("Cloudflare zone lookup failed for {$zone}: " . $e->getMessage());
+                $zoneNote = " The Cloudflare zone '{$zone}' was not linked: " . $e->getMessage();
+                $auth->auditCurrent('CLOUDFLARE_ZONE_LOOKUP_FAILED', $e->getMessage(), $zone);
             }
         }
 
@@ -101,12 +104,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($res['success']) {
                 $auth->auditCurrent('SPF_IMPORTED',
                     "Imported {$res['senders_added']} sender(s) for {$domain}", $domain);
-                setFlash("Added {$domain} and imported {$res['senders_added']} sender(s).", 'success');
+                setFlash("Added {$domain} and imported {$res['senders_added']} sender(s)." . $zoneNote, 'success');
             } else {
-                setFlash("Added {$domain}, but the SPF import failed: " . implode(' ', $res['errors']), 'warning');
+                setFlash("Added {$domain}, but the SPF import failed: " . implode(' ', $res['errors']) . $zoneNote, 'warning');
             }
         } else {
-            setFlash("Added {$domain}.", 'success');
+            setFlash("Added {$domain}." . $zoneNote, $zoneNote ? 'warning' : 'success');
         }
 
         header('Location: index.php');

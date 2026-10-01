@@ -39,7 +39,9 @@ class CloudflareAPI {
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $error = curl_error($ch);
-        curl_close($ch);
+        // curl_close() is deprecated as of PHP 8.5 — the handle is freed
+        // automatically when it goes out of scope.
+        unset($ch);
         
         if ($error) {
             throw new Exception("Cloudflare API error: " . $error);
@@ -47,7 +49,7 @@ class CloudflareAPI {
         
         $result = json_decode($response, true);
         
-        if (!$result['success']) {
+        if (!is_array($result) || empty($result['success'])) {
             throw new Exception("Cloudflare API error: " . ($result['errors'][0]['message'] ?? 'Unknown error'));
         }
         
