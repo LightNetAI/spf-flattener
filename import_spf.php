@@ -8,6 +8,7 @@ require_once __DIR__ . '/includes/Database.php';
 require_once __DIR__ . '/includes/Security.php';
 require_once __DIR__ . '/includes/Setup.php';
 require_once __DIR__ . '/includes/Auth.php';
+require_once __DIR__ . '/includes/CloudflareAPI.php';
 require_once __DIR__ . '/includes/DNSLookup.php';
 
 // Not installed yet? Send the user to the installer.
@@ -94,24 +95,41 @@ try {
 
     if ($action === 'add_and_import') {
         $domain = strtolower(trim($_POST['domain'] ?? ''));
-        $zoneId = sanitizeString($_POST['cloudflare_zone_id'] ?? '', 100);
+        $zone   = strtolower(trim($_POST['cloudflare_zone_name'] ?? ''));
 
         if (!isValidDomain($domain)) {
             echo json_encode(['success' => false, 'error' => 'That is not a valid domain name.']);
             exit;
         }
+        if ($zone !== '' && !isValidDomain($zone)) {
+            echo json_encode(['success' => false, 'error' => 'That is not a valid Cloudflare zone name.']);
+            exit;
+        }
 
         $stmt = $db->prepare("
-            INSERT INTO domains (domain, cloudflare_zone_id, is_active)
+            INSERT INTO domains (domain, cloudflare_zone_name, is_active)
             VALUES (?, ?, 1)
-            ON DUPLICATE KEY UPDATE cloudflare_zone_id = VALUES(cloudflare_zone_id)
+            ON DUPLICATE KEY UPDATE cloudflare_zone_name = VALUES(cloudflare_zone_name)
         ");
-        $stmt->execute([$domain, $zoneId]);
+        $stmt->execute([$domain, $zone ?: null]);
         $domainId = (int) $db->lastInsertId();
         if (!$domainId) {
             $s = $db->prepare("SELECT id FROM domains WHERE domain = ?");
             $s->execute([$domain]);
             $domainId = (int) $s->fetchColumn();
+        }
+
+        // Link the zone id when possible so publishing needs no extra step.
+        $zoneNote = '';
+        if ($zone !== '') {
+            try {
+                $cf = new CloudflareAPI();
+                $zoneId = $cf->getZoneId($zone);
+                $u = $db->prepare("UPDATE domains SET cloudflare_zone_id = ? WHERE id = ?");
+                $u->execute([$zoneId, $domainId]);
+            } catch (Exception $e) {
+                $zoneNote = " (Cloudflare zone '{$zone}' not found: " . $e->getMessage() . ')';
+            }
         }
 
         $dns = new DNSLookup();
@@ -135,6 +153,9 @@ try {
                 $parts[] = 'MX record(s)';
             }
             $res['import_summary'] = 'Imported ' . $res['senders_added'] . ' sender(s): ' . implode(', ', $parts) . '.';
+            if ($zoneNote !== '') {
+                $res['import_summary'] .= $zoneNote;
+            }
             $auth->auditCurrent('SPF_IMPORTED', $res['import_summary'], $domain);
         }
 

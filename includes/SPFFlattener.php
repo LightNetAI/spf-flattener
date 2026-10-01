@@ -120,7 +120,12 @@ class SPFFlattener {
             // is far too small to hold every address. Like cfspflat, we
             // emit the root record plus a chain of sub-records so the
             // entire set can be published.
-            $recordSet = $this->buildRecordSet($uniqueIps, $domain['domain'], $result['warnings']);
+            $recordSet = $this->buildRecordSet(
+                $uniqueIps,
+                $domain['domain'],
+                $domain['cloudflare_zone_name'] ?? '',
+                $result['warnings']
+            );
 
             $result['success']             = true;
             $result['original_record']     = $domain['original_spf_record'] ?? '';
@@ -519,7 +524,7 @@ class SPFFlattener {
      * @param array  $warnings Collected by reference
      * @return array{root:string,records:array,lookups:int,tokens:int}
      */
-    private function buildRecordSet($ips, $domain, &$warnings) {
+    private function buildRecordSet($ips, $sendingDomain, $zone, &$warnings) {
         // Collapse addresses to the minimal set of CIDRs, exactly as
         // netaddr.IPSet(...).iter_cidrs() does upstream.
         $tokens = [];
@@ -530,13 +535,24 @@ class SPFFlattener {
         $collapsed = IPUtil::collapse($tokens);
         $spfTokens = $collapsed['spf'];
 
-        if (empty($spfTokens)) {
-            return ['root' => 'v=spf1 -all', 'records' => [], 'lookups' => 0, 'tokens' => 0];
+        // Where the chain lives. With a Cloudflare zone configured, records
+        // are created under that zone: flattening sandalford.com into the
+        // uid0.au zone yields spf0.sandalford.uid0.au and so on.
+        $base = $sendingDomain;
+        if ($zone !== null && $zone !== '') {
+            $base = $sendingDomain . '.' . $zone;
         }
 
-        // Pack tokens into records within the byte budget.
-        $budget = defined('SPF_RECORD_BYTES') ? SPF_RECORD_BYTES : 450;
-        $blocks = $this->fitBytes($spfTokens, $budget);
+        if (empty($spfTokens)) {
+            return [
+                'root' => 'v=spf1 -all', 'records' => [],
+                'lookups' => 0, 'tokens' => 0, 'base' => $base,
+            ];
+        }
+
+        // Pack into records that stay within the character limit.
+        $limit  = defined('SPF_CHAR_LIMIT') ? SPF_CHAR_LIMIT : 255;
+        $blocks = $this->fitRecords($spfTokens, $base, $limit);
 
         $records = [];
         $lastIndex = count($blocks) - 1;
@@ -546,11 +562,11 @@ class SPFFlattener {
             if ($i === $lastIndex) {
                 $record = "v=spf1 {$body} -all";
             } else {
-                // Chained forward to the next record, mirroring upstream.
-                $record = 'v=spf1 ' . $body . ' include:spf' . ($i + 1) . ".{$domain} -all";
+                // Chain forward: spf0 -> spf1 -> spf2 …
+                $record = 'v=spf1 ' . $body . ' include:spf' . ($i + 1) . ".{$base} -all";
             }
             $records[] = [
-                'name'    => "spf{$i}.{$domain}",
+                'name'    => "spf{$i}.{$base}",
                 'content' => $record,
             ];
         }
@@ -558,14 +574,14 @@ class SPFFlattener {
         // The root record is the first link in the chain.
         $root = $records[0]['content'];
 
-        // 255 is the limit for a single DNS character-string, not for a whole
-        // TXT record: longer records are published as several quoted strings
-        // inside one record. formatForBind() renders that form.
+        // Every record should fit a single DNS character-string so it can be
+        // pasted straight into a provider's form. Anything longer has to be
+        // published as several quoted strings instead.
         foreach ($records as $rec) {
-            if (strlen($rec['content']) > MAX_SPF_LENGTH) {
+            if (strlen($rec['content']) > $limit) {
                 $warnings[] = "Record {$rec['name']} is " . strlen($rec['content'])
-                            . ' characters and must be published as multiple quoted '
-                            . 'strings (see the BIND format in the detail view).';
+                            . " characters, over the {$limit}-character limit; "
+                            . 'publish it as multiple quoted strings (BIND format).';
                 break;
             }
         }
@@ -575,15 +591,15 @@ class SPFFlattener {
             'records' => $records,
             'lookups' => count($records),
             'tokens'  => count($spfTokens),
+            'base'    => $base,
         ];
     }
 
     /**
-     * Render a record as quoted 255-character-safe strings, the format used
-     * in zone files and by many DNS providers.
+     * Render a record as quoted strings, the format used in zone files and by
+     * providers that expect the multi-string form.
      *
-     * Mirrors sender_policy_flattener's format_rrecord_value_for_bind(),
-     * which wraps four tokens per line.
+     * Mirrors sender_policy_flattener's format_rrecord_value_for_bind().
      *
      * @return string
      */
@@ -611,42 +627,44 @@ class SPFFlattener {
     }
 
     /**
-     * Pack SPF tokens into blocks that stay inside the byte budget.
+     * Pack SPF tokens into records within the character limit.
      *
-     * Mirrors sender_policy_flattener's fit_bytes(): start with one block
-     * and move the last token into a new block until each fits. Upstream
-     * measures with sys.getsizeof(), which includes interpreter overhead,
-     * so the same budget is applied here for comparable output.
+     * Room is reserved for the record's own include:spf<N>.<base> link, so a
+     * record cannot overflow once its chain reference is appended.
      *
-     * @param int $budget Upper bound in bytes when the record is serialised
+     * @param array  $tokens Address tokens in preference order
+     * @param string $base   The chain's suffix
+     * @param int    $limit  Character limit per record
      * @return array List of blocks, each a list of tokens
      */
-    private function fitBytes(array $tokens, $budget) {
-        $blocks = [array_values($tokens)];
+    private function fitRecords(array $tokens, $base, $limit) {
+        // Worst-case chain reference, so no block overflows.
+        $overhead = strlen('v=spf1') + strlen(' include:spf99.' . $base . ' -all');
 
-        for ($index = 0; $index < count($blocks); $index++) {
-            while ($this->measureRecord($blocks[$index]) >= $budget && !empty($blocks[$index])) {
-                $overflow = array_pop($blocks[$index]);
-                if (!isset($blocks[$index + 1])) {
-                    $blocks[$index + 1] = [];
-                }
-                // Upstream appends the overflow to the front of the next block.
-                array_unshift($blocks[$index + 1], $overflow);
+        $blocks  = [];
+        $current = [];
+        $used    = $overhead;
+
+        foreach (array_values($tokens) as $token) {
+            $cost = strlen($token) + 1; // one leading space
+
+            if (!empty($current) && ($used + $cost) > $limit) {
+                $blocks[] = $current;
+                $current = [];
+                $used = $overhead;
             }
+
+            // A single token larger than the limit cannot be split further;
+            // keep it and let the caller warn rather than silently dropping it.
+            $current[] = $token;
+            $used += $cost;
         }
 
-        // Drop any block that ended up empty.
-        return array_values(array_filter($blocks, fn($b) => !empty($b)));
-    }
+        if (!empty($current)) {
+            $blocks[] = $current;
+        }
 
-    /**
-     * Approximate the serialised size of a record built from these tokens.
-     * The 49-byte constant accounts for sys.getsizeof() overhead so the
-     * budget behaves like upstream's.
-     */
-    private function measureRecord(array $tokens) {
-        $body = implode(' ', $tokens);
-        return strlen("v=spf1 {$body} include:spf1.example.domain.com -all") + 49;
+        return $blocks;
     }
 
     /* ========================================================

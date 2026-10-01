@@ -75,8 +75,9 @@ ON DUPLICATE KEY UPDATE config_value=config_value;
 -- Domains table - stores domains to flatten
 CREATE TABLE IF NOT EXISTS domains (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    domain VARCHAR(255) NOT NULL UNIQUE,
+    domain VARCHAR(255) NOT NULL UNIQUE,          -- the sending domain, e.g. sandalford.com
     cloudflare_zone_id VARCHAR(100),
+    cloudflare_zone_name VARCHAR(255) DEFAULT NULL, -- e.g. uid0.au; chain records are created under it
     original_spf_record TEXT,
     flattened_spf_record TEXT,
     lookup_count_before INT DEFAULT 0,

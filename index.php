@@ -51,7 +51,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     /* ---- Add domain ---- */
     if ($action === 'add_domain') {
         $domain = strtolower(trim($_POST['domain'] ?? ''));
-        $zoneId = sanitizeString($_POST['cloudflare_zone_id'] ?? '', 100);
+        $zone   = strtolower(trim($_POST['cloudflare_zone_name'] ?? ''));
         $import = isset($_POST['import_spf']);
 
         if (!isValidDomain($domain)) {
@@ -59,13 +59,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             header('Location: index.php');
             exit;
         }
+        if ($zone !== '' && !isValidDomain($zone)) {
+            setFlash('Invalid Cloudflare zone name.', 'error');
+            header('Location: index.php');
+            exit;
+        }
 
         $stmt = $db->prepare("
-            INSERT INTO domains (domain, cloudflare_zone_id, is_active)
+            INSERT INTO domains (domain, cloudflare_zone_name, is_active)
             VALUES (?, ?, 1)
-            ON DUPLICATE KEY UPDATE cloudflare_zone_id = VALUES(cloudflare_zone_id)
+            ON DUPLICATE KEY UPDATE cloudflare_zone_name = VALUES(cloudflare_zone_name)
         ");
-        $stmt->execute([$domain, $zoneId]);
+        $stmt->execute([$domain, $zone ?: null]);
         $domainId = (int) $db->lastInsertId();
         if (!$domainId) {
             $s = $db->prepare("SELECT id FROM domains WHERE domain = ?");
@@ -73,7 +78,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $domainId = (int) $s->fetchColumn();
         }
 
-        $auth->auditCurrent('DOMAIN_ADDED', "Added domain {$domain}", $domain);
+        // Resolve the Cloudflare zone id so publishing works without a
+        // separate configuration step.
+        if ($zone !== '') {
+            try {
+                $cf = new CloudflareAPI();
+                $zoneId = $cf->getZoneId($zone);
+                $u = $db->prepare("UPDATE domains SET cloudflare_zone_id = ? WHERE id = ?");
+                $u->execute([$zoneId, $domainId]);
+            } catch (Exception $e) {
+                setFlash("Saved {$domain}, but the Cloudflare zone '{$zone}' could not be found: "
+                       . $e->getMessage(), 'warning');
+            }
+        }
+
+        $auth->auditCurrent('DOMAIN_ADDED',
+            "Added {$domain}" . ($zone ? " (zone {$zone})" : ''), $domain);
 
         if ($import) {
             $dns = new DNSLookup();
@@ -410,7 +430,9 @@ $csrf          = generateCSRFToken();
                     <span class="badge badge-neutral" title="Imported SPF record snapshots on file">
                       <?= (int) $d['record_count'] ?> record<?= (int) $d['record_count'] === 1 ? '' : 's' ?>
                     </span><br>
-                    <?php if ($d['cloudflare_zone_id']): ?>
+                    <?php if ($d['cloudflare_zone_name']): ?>
+                      <span class="badge badge-info">zone: <?= htmlspecialchars($d['cloudflare_zone_name']) ?></span>
+                    <?php elseif ($d['cloudflare_zone_id']): ?>
                       <span class="badge badge-info">Cloudflare</span>
                     <?php endif; ?>
                     <?php if (!$d['is_active']): ?>
@@ -507,14 +529,20 @@ $csrf          = generateCSRFToken();
 
         <div class="form-group">
           <label class="form-label" for="import_domain">Domain <span class="req">*</span></label>
-          <input class="form-input" type="text" id="import_domain" placeholder="example.com"
+          <input class="form-input" type="text" id="import_domain" placeholder="sandalford.com"
                  autocomplete="off" spellcheck="false">
-          <div class="form-hint">Either button below works on its own — fetching first just previews the record.</div>
+          <div class="form-hint">The sending domain whose SPF record you want to flatten.</div>
         </div>
         <div class="form-group">
-          <label class="form-label" for="import_zone">Cloudflare Zone ID <span class="muted">(optional)</span></label>
-          <input class="form-input" type="text" id="import_zone" placeholder="Leave blank if not using Cloudflare"
-                 autocomplete="off">
+          <label class="form-label" for="import_zone">Cloudflare Zone <span class="muted">(optional but recommended)</span></label>
+          <input class="form-input" type="text" id="import_zone" placeholder="uid0.au"
+                 autocomplete="off" spellcheck="false">
+          <div class="form-hint">
+            Records are created under this zone. Flattening <span class="inline-code">sandalford.com</span>
+            into <span class="inline-code">uid0.au</span> produces
+            <span class="inline-code">spf0.sandalford.uid0.au</span>, <span class="inline-code">spf1.sandalford.uid0.au</span>…
+            Leave blank to name them under the sending domain instead.
+          </div>
         </div>
 
         <div class="flex-between">
@@ -539,11 +567,15 @@ $csrf          = generateCSRFToken();
           <input type="hidden" name="action" value="add_domain">
           <div class="form-group">
             <label class="form-label" for="domain">Domain <span class="req">*</span></label>
-            <input class="form-input" type="text" id="domain" name="domain" placeholder="example.com" required>
+            <input class="form-input" type="text" id="domain" name="domain" placeholder="sandalford.com" required>
           </div>
           <div class="form-group">
-            <label class="form-label" for="zone">Cloudflare Zone ID</label>
-            <input class="form-input" type="text" id="zone" name="cloudflare_zone_id" placeholder="Optional">
+            <label class="form-label" for="zone">Cloudflare Zone</label>
+            <input class="form-input" type="text" id="zone" name="cloudflare_zone_name" placeholder="uid0.au">
+            <div class="form-hint">
+              Chain records are created as <span class="inline-code">spf0.&lt;domain&gt;.&lt;zone&gt;</span>.
+              Leave blank to use the sending domain.
+            </div>
           </div>
           <div class="form-group form-check">
             <input type="checkbox" id="import_spf" name="import_spf" value="1" checked>
@@ -827,7 +859,7 @@ async function importSPF() {
   const fd = new FormData();
   fd.append('action', 'add_and_import');
   fd.append('domain', domain);
-  fd.append('cloudflare_zone_id', zone);
+  fd.append('cloudflare_zone_name', zone);
   fd.append('csrf_token', CSRF);
 
   try {

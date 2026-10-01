@@ -48,9 +48,13 @@ defined('MAX_SPF_LENGTH')  || define('MAX_SPF_LENGTH', 255);
 defined('MAX_DNS_LOOKUPS') || define('MAX_DNS_LOOKUPS', 10);
 defined('DNS_CACHE_TTL')   || define('DNS_CACHE_TTL', 3600); // seconds
 
-// Byte budget per generated SPF record. Matches sender_policy_flattener's
-// fit_bytes() default of 450, so record splitting mirrors cfspflat.
+// Byte budget per generated SPF record, retained for reference. Splitting is
+// driven by SPF_CHAR_LIMIT below, matching the 255-character DNS limit.
 defined('SPF_RECORD_BYTES') || define('SPF_RECORD_BYTES', 450);
+
+// Maximum characters in a single generated record. Records are packed to this
+// so each one fits a DNS character-string and pastes cleanly into a provider.
+defined('SPF_CHAR_LIMIT') || define('SPF_CHAR_LIMIT', 255);
 
 // Logging
 defined('LOG_FILE')  || define('LOG_FILE', __DIR__ . '/../logs/spf-flattener.log');
