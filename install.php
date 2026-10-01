@@ -136,23 +136,25 @@ try {
         $statement = trim($statement);
         if ($statement === '') continue;
 
-        // The dump contains "USE <name>", and "CREATE DATABASE IF NOT EXISTS
-        // <name>". Both would redirect the import into the shipped default
-        // database instead of the one the operator chose.
-        if (preg_match('/^\s*USE\s+/i', $statement)) {
+        // The dump opens with "CREATE DATABASE IF NOT EXISTS spf_flattener"
+        // and "USE spf_flattener". Both name the shipped default: on a
+        // restricted account they fail with "Access denied ... to database
+        // 'spf_flattener'", and on a privileged one they redirect the import
+        // away from the database the operator chose. We have already created
+        // and selected the right database, so skip them.
+        if (preg_match('/^\s*(USE|CREATE\s+DATABASE)\b/i', $statement)) {
             continue;
         }
-        $statement = preg_replace(
-            '/^\s*CREATE\s+DATABASE\s+IF\s+NOT\s+EXISTS\s+`?[A-Za-z0-9_]+`?/i',
-            'CREATE DATABASE IF NOT EXISTS `' . $name . '`',
-            $statement
-        );
 
         try {
             $pdo->exec($statement);
         } catch (PDOException $e) {
             $msg = $e->getMessage();
-            if (stripos($msg, 'already exists') === false && stripos($msg, 'Duplicate') === false) {
+            $code = $e->errorInfo[1] ?? 0;
+            $benign = in_array($code, [1007, 1050, 1061, 1062, 1826], true)
+                || stripos($msg, 'already exists') !== false
+                || stripos($msg, 'Duplicate') !== false;
+            if (!$benign) {
                 throw $e;
             }
         }

@@ -285,10 +285,13 @@ class Setup {
                 continue;
             }
 
-            // The dump contains "USE <name>". Executing it would redirect the
-            // import into the shipped default database rather than the one the
-            // operator chose, so drop it.
-            if (preg_match('/^\s*USE\s+/i', $trimmed)) {
+            // Skip statements that name a specific database. The installer has
+            // already created and selected the operator's database; the dump's
+            // own CREATE DATABASE / USE refer to the shipped default, which on
+            // a restricted account fails with "Access denied for user
+            // 'x'@'localhost' to database 'spf_flattener'" — or, for a
+            // privileged account, silently redirects the import elsewhere.
+            if (preg_match('/^\s*(USE|CREATE\s+DATABASE)\b/i', $trimmed)) {
                 continue;
             }
 
@@ -298,7 +301,7 @@ class Setup {
                 // "already exists" is expected on a re-run and is harmless.
                 $code = $e->errorInfo[1] ?? 0;
                 $msg  = $e->getMessage();
-                $benign = in_array($code, [1050, 1061, 1062, 1826], true)
+                $benign = in_array($code, [1007, 1050, 1061, 1062, 1826], true)
                     || stripos($msg, 'already exists') !== false
                     || stripos($msg, 'Duplicate') !== false;
 
@@ -387,15 +390,15 @@ class Setup {
 
     /**
      * Write config/config.local.php.
+     *
+     * Overwrites unconditionally: the wizard only renders the database step
+     * when the application is not already installed, so reaching here is an
+     * explicit (re)configuration request. The credentials have already been
+     * verified by testConnection() before this runs.
      */
     private function writeLocalConfig($host, $port, $user, $pass, $name) {
         $configDir = dirname(__DIR__) . '/config';
         $target = $configDir . '/config.local.php';
-
-        // Refuse to clobber an existing working configuration.
-        if (file_exists($target) && !self::isPlaceholderConfig()) {
-            throw new RuntimeException('config/config.local.php already exists and appears to be configured.');
-        }
 
         $q = fn($v) => "'" . str_replace(["\\", "'"], ["\\\\", "\\'"], (string) $v) . "'";
 
