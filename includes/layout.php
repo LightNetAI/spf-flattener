@@ -11,13 +11,19 @@
  */
 function renderHeader(Auth $auth, $active = '') {
     $user = $auth->user();
+
+    // The tab bar has been removed, so the top nav is now the only way to
+    // reach each panel: index.php#add, #senders and #config.
+    $isAdmin  = $user ? $user['role'] === 'admin' : false;
+    $canWrite = $user ? in_array($user['role'], ['admin', 'operator'], true) : false;
+
     $items = [
-        'domains' => ['index.php',        'Domains'],
-        'add'     => ['index.php#add',    'Add Domain'],
-        'senders' => ['index.php#senders','Senders'],
-        'log'     => ['audit.php',        'Audit Log'],
-        'users'   => ['users.php',        'Users'],
-        'config'  => ['index.php#config', 'Settings'],
+        'domains' => ['index.php',          'Domains',     true],
+        'add'     => ['index.php#add',      'Add Domain',  $canWrite],
+        'senders' => ['index.php#senders',  'Senders',     $canWrite],
+        'log'     => ['audit.php',          'Audit Log',   true],
+        'config'  => ['index.php#config',   'Settings',    $isAdmin],
+        'users'   => ['users.php',          'Users',       $isAdmin],
     ];
     ?>
     <div class="progress-bar" id="progressBar"></div>
@@ -33,8 +39,8 @@ function renderHeader(Auth $auth, $active = '') {
 
           <?php if ($user): ?>
           <nav class="nav">
-            <?php foreach ($items as $key => [$href, $text]):
-                if ($key === 'users' && $user['role'] !== 'admin') { continue; }
+            <?php foreach ($items as $key => [$href, $text, $visible]):
+                if (!$visible) { continue; }
             ?>
               <a class="nav__link <?= $active === $key ? 'active' : '' ?>" href="<?= htmlspecialchars($href) ?>"><?= htmlspecialchars($text) ?></a>
             <?php endforeach; ?>

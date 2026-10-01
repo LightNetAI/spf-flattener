@@ -124,7 +124,8 @@
     if (el) {
       el.classList.add('active');
     } else {
-      // Match the tab button to the panel by its onclick target.
+      // The tab bar is hidden; still update its buttons when present so the
+      // markup stays consistent if it is ever shown again.
       var match = null;
       document.querySelectorAll('.tab').forEach(function (t) {
         var attr = t.getAttribute('onclick') || '';

@@ -340,7 +340,7 @@ $csrf          = generateCSRFToken();
     </div>
   </div>
 
-  <div class="tabs">
+  <div class="tabs hidden" aria-hidden="true">
     <button class="tab active" onclick="showTab('tab-domains', this)">Domains</button>
     <button class="tab" onclick="showTab('tab-add', this)">Add Domain</button>
     <button class="tab" onclick="showTab('tab-senders', this)">Senders</button>
