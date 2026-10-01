@@ -471,16 +471,19 @@ $csrf          = generateCSRFToken();
 
         <div class="form-group">
           <label class="form-label" for="import_domain">Domain <span class="req">*</span></label>
-          <input class="form-input" type="text" id="import_domain" placeholder="example.com">
+          <input class="form-input" type="text" id="import_domain" placeholder="example.com"
+                 autocomplete="off" spellcheck="false">
+          <div class="form-hint">Either button below works on its own — fetching first just previews the record.</div>
         </div>
         <div class="form-group">
           <label class="form-label" for="import_zone">Cloudflare Zone ID <span class="muted">(optional)</span></label>
-          <input class="form-input" type="text" id="import_zone" placeholder="Leave blank if not using Cloudflare">
+          <input class="form-input" type="text" id="import_zone" placeholder="Leave blank if not using Cloudflare"
+                 autocomplete="off">
         </div>
 
         <div class="flex-between">
-          <button class="btn btn-outline" type="button" onclick="fetchSPF()">Fetch SPF</button>
-          <button class="btn btn-primary" type="button" id="importBtn" onclick="importSPF()" disabled>Import &amp; Add</button>
+          <button class="btn btn-outline" type="button" id="fetchBtn" onclick="fetchSPF()">Fetch SPF</button>
+          <button class="btn btn-primary" type="button" id="importBtn" onclick="importSPF()">Import &amp; Add</button>
         </div>
 
         <div id="spfPreview" class="mt-16 hidden"></div>
@@ -705,13 +708,13 @@ const CSRF = <?= json_encode($csrf) ?>;
 async function fetchSPF() {
   const domain = document.getElementById('import_domain').value.trim();
   const box = document.getElementById('spfPreview');
-  const btn = document.getElementById('importBtn');
+  const btn = document.getElementById('fetchBtn');
 
   if (!domain) { alert('Enter a domain name first.'); return; }
 
   box.className = 'mt-16';
   box.innerHTML = '<p class="muted">Querying DNS…</p>';
-  btn.disabled = true;
+  if (btn) { btn.disabled = true; btn.textContent = 'Fetching…'; }
 
   const fd = new FormData();
   fd.append('action', 'fetch_spf');
@@ -720,7 +723,7 @@ async function fetchSPF() {
 
   try {
     const res = await fetch('import_spf.php', { method: 'POST', body: fd });
-    const out = await res.json();
+    const out = await decodeJson(res);
 
     if (!out.success) {
       box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
@@ -765,10 +768,11 @@ async function fetchSPF() {
     if (out.redirect) html += '<p class="form-hint mt-8">↻ Redirects to ' + escapeHtml(out.redirect) + '</p>';
 
     box.innerHTML = html;
-    btn.disabled = false;
   } catch (e) {
     box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
       + escapeHtml(e.message) + '</div></div>';
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Fetch SPF'; }
   }
 }
 
@@ -776,10 +780,13 @@ async function importSPF() {
   const domain = document.getElementById('import_domain').value.trim();
   const zone = document.getElementById('import_zone').value.trim();
   const box = document.getElementById('spfPreview');
+  const btn = document.getElementById('importBtn');
 
   if (!domain) { alert('Enter a domain name first.'); return; }
 
+  box.className = 'mt-16';
   box.innerHTML = '<p class="muted">Importing…</p>';
+  if (btn) { btn.disabled = true; btn.textContent = 'Importing…'; }
 
   const fd = new FormData();
   fd.append('action', 'add_and_import');
@@ -789,19 +796,44 @@ async function importSPF() {
 
   try {
     const res = await fetch('import_spf.php', { method: 'POST', body: fd });
-    const out = await res.json();
+    const out = await decodeJson(res);
 
     if (out.success) {
       box.innerHTML = '<div class="alert alert-success"><span class="alert__icon">✓</span><div>'
         + escapeHtml(out.import_summary || 'Imported successfully.') + '<br>Reloading…</div></div>';
       setTimeout(() => { window.location.href = 'index.php'; }, 1600);
-    } else {
-      box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
-        + escapeHtml((out.errors && out.errors.join(' ')) || out.error || 'Import failed.') + '</div></div>';
+      return;
     }
+
+    box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
+      + escapeHtml((out.errors && out.errors.join(' ')) || out.error || 'Import failed.') + '</div></div>';
   } catch (e) {
     box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
       + escapeHtml(e.message) + '</div></div>';
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Import & Add'; }
+  }
+}
+
+/**
+ * Parse a JSON response, surfacing a readable error when the server returns
+ * HTML (a PHP notice, a 500, or a session expiry page) instead of JSON.
+ */
+async function decodeJson(res) {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    if (res.status === 401) {
+      return { success: false, error: 'Your session expired. Reload the page and sign in again.' };
+    }
+    // Strip tags so the raw HTML does not end up in the message.
+    const plain = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    return {
+      success: false,
+      error: 'The server did not return JSON (HTTP ' + res.status + '). '
+           + (plain ? plain.slice(0, 200) : 'No response body.')
+    };
   }
 }
 
