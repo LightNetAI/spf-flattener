@@ -6,18 +6,34 @@
  */
 
 /**
- * Validate domain name format
- * 
- * @param string $domain Domain name to validate
- * @return bool True if valid domain format
+ * Validate a DNS name suitable for use in an SPF include: or an A/MX lookup.
+ *
+ * Underscores are permitted because they are ubiquitous in SPF and DKIM
+ * records (_spf.google.com, _netblocks.google.com, _dmarc.example.com).
+ * The character class is deliberately narrow: it admits nothing that could
+ * be interpreted by a shell, so the value is safe to pass to dig after
+ * escapeshellarg() as well.
+ *
+ * @param string $domain
+ * @return bool
  */
 function isValidDomain($domain) {
-    if (!is_string($domain) || empty($domain) || strlen($domain) > 253) {
+    if (!is_string($domain) || $domain === '' || strlen($domain) > 253) {
         return false;
     }
-    
-    // RFC 1035 compliant domain validation
-    return (bool) preg_match('/^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9]))*$/i', $domain);
+
+    // Each label: alphanumerics, hyphen or underscore; must not start or
+    // end with a hyphen. At least two labels are required.
+    if (!preg_match('/^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)+$/i', $domain)) {
+        return false;
+    }
+
+    // Reject a trailing dot and any residual whitespace.
+    if (str_ends_with($domain, '.') || preg_match('/\s/', $domain)) {
+        return false;
+    }
+
+    return true;
 }
 
 /**

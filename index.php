@@ -1,892 +1,802 @@
 <?php
 /**
- * SPF Flattener - Main Dashboard
- * Web GUI for managing SPF record flattening
+ * SPF Flattener — Dashboard
+ * ATS Solutions branded, authentication required.
  */
 
 require_once __DIR__ . '/config/config.php';
 require_once __DIR__ . '/includes/Database.php';
+require_once __DIR__ . '/includes/Security.php';
+require_once __DIR__ . '/includes/Auth.php';
+require_once __DIR__ . '/includes/layout.php';
 require_once __DIR__ . '/includes/SPFFlattener.php';
 require_once __DIR__ . '/includes/CloudflareAPI.php';
 require_once __DIR__ . '/includes/EmailNotifier.php';
 require_once __DIR__ . '/includes/DNSLookup.php';
 
-$db = getDB();
+Auth::startSession();
+$auth = new Auth();
+$auth->requireLogin();
+
+$db        = getDB();
 $flattener = new SPFFlattener();
-$message = '';
-$messageType = '';
+$user      = $auth->user();
+$canWrite  = in_array($user['role'], ['admin', 'operator'], true);
 
-// Handle form submissions
+/* ------------------------------------------------------------
+ * POST handling
+ * ---------------------------------------------------------- */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+        setFlash('Your session expired. Please try again.', 'error');
+        header('Location: index.php');
+        exit;
+    }
+    if (!$canWrite) {
+        $auth->auditCurrent('ACCESS_DENIED', 'Attempted write as ' . $user['role']);
+        setFlash('Your role does not permit changes.', 'error');
+        header('Location: index.php');
+        exit;
+    }
+
     $action = $_POST['action'] ?? '';
-    
+
+    /* ---- Add domain ---- */
     if ($action === 'add_domain') {
-        $domain = trim($_POST['domain'] ?? '');
-        $cloudflareZoneId = trim($_POST['cloudflare_zone_id'] ?? '');
-        $importSpf = isset($_POST['import_spf']);
-        
-        if (!empty($domain)) {
-            try {
-                $stmt = $db->prepare("
-                    INSERT INTO domains (domain, cloudflare_zone_id, is_active)
-                    VALUES (?, ?, 1)
-                    ON DUPLICATE KEY UPDATE cloudflare_zone_id = VALUES(cloudflare_zone_id)
-                ");
-                $stmt->execute([$domain, $cloudflareZoneId]);
-                $domainId = $db->lastInsertId();
-                
-                // Optionally import SPF record via DNS lookup
-                if ($importSpf) {
-                    $dns = new DNSLookup();
-                    $importResult = $dns->importSPFForDomain($domainId);
-                    
-                    if ($importResult['success']) {
-                        $message = "Domain {$domain} added and SPF imported ({$importResult['senders_added']} senders found)";
-                    } else {
-                        $message = "Domain {$domain} added, but SPF import failed: " . implode(', ', $importResult['errors']);
-                        $messageType = 'warning';
-                    }
-                } else {
-                    $message = "Domain {$domain} added successfully";
-                }
-                $messageType = 'success';
-            } catch (Exception $e) {
-                $message = "Error adding domain: " . $e->getMessage();
-                $messageType = 'error';
-            }
+        $domain = strtolower(trim($_POST['domain'] ?? ''));
+        $zoneId = sanitizeString($_POST['cloudflare_zone_id'] ?? '', 100);
+        $import = isset($_POST['import_spf']);
+
+        if (!isValidDomain($domain)) {
+            setFlash('Invalid domain name. Use a format like example.com', 'error');
+            header('Location: index.php');
+            exit;
         }
+
+        $stmt = $db->prepare("
+            INSERT INTO domains (domain, cloudflare_zone_id, is_active)
+            VALUES (?, ?, 1)
+            ON DUPLICATE KEY UPDATE cloudflare_zone_id = VALUES(cloudflare_zone_id)
+        ");
+        $stmt->execute([$domain, $zoneId]);
+        $domainId = (int) $db->lastInsertId();
+        if (!$domainId) {
+            $s = $db->prepare("SELECT id FROM domains WHERE domain = ?");
+            $s->execute([$domain]);
+            $domainId = (int) $s->fetchColumn();
+        }
+
+        $auth->auditCurrent('DOMAIN_ADDED', "Added domain {$domain}", $domain);
+
+        if ($import) {
+            $dns = new DNSLookup();
+            $res = $dns->importSPFForDomain($domainId);
+            if ($res['success']) {
+                $auth->auditCurrent('SPF_IMPORTED',
+                    "Imported {$res['senders_added']} sender(s) for {$domain}", $domain);
+                setFlash("Added {$domain} and imported {$res['senders_added']} sender(s).", 'success');
+            } else {
+                setFlash("Added {$domain}, but the SPF import failed: " . implode(' ', $res['errors']), 'warning');
+            }
+        } else {
+            setFlash("Added {$domain}.", 'success');
+        }
+
+        header('Location: index.php');
+        exit;
     }
-    
-    elseif ($action === 'add_sender') {
-        $domainId = $_POST['domain_id'] ?? 0;
-        $sendingDomain = trim($_POST['sending_domain'] ?? '');
-        $senderName = trim($_POST['sender_name'] ?? '');
-        $includeDomain = trim($_POST['include_domain'] ?? '');
-        
-        if (!empty($sendingDomain) && !empty($includeDomain)) {
-            try {
-                // First check if sending domain exists
-                $stmt = $db->prepare("SELECT id FROM sending_domains WHERE domain_id = ? AND sending_domain = ?");
-                $stmt->execute([$domainId, $sendingDomain]);
-                $sendingDomainId = $stmt->fetchColumn();
-                
-                if (!$sendingDomainId) {
-                    // Create sending domain
-                    $stmt = $db->prepare("INSERT INTO sending_domains (domain_id, sending_domain) VALUES (?, ?)");
-                    $stmt->execute([$domainId, $sendingDomain]);
-                    $sendingDomainId = $db->lastInsertId();
-                }
-                
-                // Add approved sender
-                $stmt = $db->prepare("
-                    INSERT INTO approved_senders (sending_domain_id, sender_name, include_domain)
-                    VALUES (?, ?, ?)
-                ");
-                $stmt->execute([$sendingDomainId, $senderName, $includeDomain]);
-                
-                $message = "Sender added successfully";
-                $messageType = 'success';
-            } catch (Exception $e) {
-                $message = "Error adding sender: " . $e->getMessage();
-                $messageType = 'error';
-            }
+
+    /* ---- Delete domain ---- */
+    if ($action === 'delete_domain') {
+        $domainId = sanitizeInt($_POST['domain_id'] ?? 0);
+        $s = $db->prepare("SELECT domain FROM domains WHERE id = ?");
+        $s->execute([$domainId]);
+        $name = $s->fetchColumn();
+
+        if ($name) {
+            $stmt = $db->prepare("DELETE FROM domains WHERE id = ?");
+            $stmt->execute([$domainId]);
+            $auth->auditCurrent('DOMAIN_DELETED', "Deleted domain {$name}", $name);
+            setFlash("Deleted {$name}.", 'success');
         }
+        header('Location: index.php');
+        exit;
     }
-    
-    elseif ($action === 'flatten') {
-        $domainId = $_POST['domain_id'] ?? 0;
-        
-        if ($domainId) {
-            try {
-                $result = $flattener->flattenDomain($domainId);
-                
-                if ($result['success']) {
-                    // Check if auto-update is enabled
-                    if (AUTO_UPDATE_ENABLED && !empty($result['flattened_record'])) {
-                        try {
-                            $cfApi = new CloudflareAPI();
-                            $domainStmt = $db->prepare("SELECT domain FROM domains WHERE id = ?");
-                            $domainStmt->execute([$domainId]);
-                            $domain = $domainStmt->fetchColumn();
-                            
-                            $cfApi->updateDomainSPF($domain, $result['flattened_record']);
-                            
-                            // Send notification
-                            $notifier = new EmailNotifier();
-                            $notifier->sendUpdateNotification($domain, $result['flattened_record'], count($result['ips_collected']));
-                            
-                            $message = "SPF flattened and Cloudflare updated successfully";
-                        } catch (Exception $cfError) {
-                            $message = "SPF flattened but Cloudflare update failed: " . $cfError->getMessage();
-                            $messageType = 'warning';
-                        }
-                    } else {
-                        $message = "SPF record flattened successfully";
-                    }
-                    $messageType = 'success';
-                } else {
-                    $message = "Flattening failed: " . implode(', ', $result['errors']);
-                    $messageType = 'error';
-                }
-            } catch (Exception $e) {
-                $message = "Error: " . $e->getMessage();
-                $messageType = 'error';
-            }
+
+    /* ---- Add sender ---- */
+    if ($action === 'add_sender') {
+        $domainId     = sanitizeInt($_POST['domain_id'] ?? 0);
+        $sendingName  = strtolower(trim($_POST['sending_domain'] ?? ''));
+        $senderName   = sanitizeString($_POST['sender_name'] ?? '', 255);
+        $includeRaw   = trim($_POST['include_domain'] ?? '');
+
+        if (!isValidDomain($sendingName) || $includeRaw === '' || $senderName === '') {
+            setFlash('Please provide a valid sending domain, sender name and include.', 'error');
+            header('Location: index.php#senders');
+            exit;
         }
+
+        // Direct ip4:/ip6: entries and plain include domains are both stored here.
+        if (!preg_match('/^(ip4|ip6):[0-9a-f:.\/]+$/i', $includeRaw) && !isValidDomain($includeRaw)) {
+            setFlash('Include must be a domain, or an ip4:/ip6: entry.', 'error');
+            header('Location: index.php#senders');
+            exit;
+        }
+        $include = $includeRaw;
+
+        $stmt = $db->prepare("SELECT id FROM sending_domains WHERE domain_id = ? AND sending_domain = ?");
+        $stmt->execute([$domainId, $sendingName]);
+        $sendingDomainId = $stmt->fetchColumn();
+
+        if (!$sendingDomainId) {
+            $stmt = $db->prepare("INSERT INTO sending_domains (domain_id, sending_domain) VALUES (?, ?)");
+            $stmt->execute([$domainId, $sendingName]);
+            $sendingDomainId = $db->lastInsertId();
+        }
+
+        $stmt = $db->prepare("
+            INSERT INTO approved_senders (sending_domain_id, sender_name, include_domain)
+            VALUES (?, ?, ?)
+        ");
+        $stmt->execute([$sendingDomainId, $senderName, $include]);
+
+        $auth->auditCurrent('SENDER_ADDED', "Added sender '{$senderName}' ({$include})", $sendingName);
+        setFlash('Added the sender.', 'success');
+        header('Location: index.php#senders');
+        exit;
     }
-    
-    elseif ($action === 'delete_domain') {
-        $domainId = $_POST['domain_id'] ?? 0;
-        
-        if ($domainId) {
+
+    /* ---- Delete sender ---- */
+    if ($action === 'delete_sender') {
+        $senderId = sanitizeInt($_POST['sender_id'] ?? 0);
+        $s = $db->prepare("SELECT sender_name, include_domain FROM approved_senders WHERE id = ?");
+        $s->execute([$senderId]);
+        $row = $s->fetch();
+
+        if ($row) {
+            $stmt = $db->prepare("DELETE FROM approved_senders WHERE id = ?");
+            $stmt->execute([$senderId]);
+            $auth->auditCurrent('SENDER_DELETED', "Deleted sender '{$row['sender_name']}'");
+            setFlash('Removed the sender.', 'success');
+        }
+        header('Location: index.php#senders');
+        exit;
+    }
+
+    /* ---- Flatten ---- */
+    if ($action === 'flatten') {
+        $domainId = sanitizeInt($_POST['domain_id'] ?? 0);
+        $push     = isset($_POST['push_cloudflare']);
+
+        $result = $flattener->flattenDomain($domainId);
+
+        if (!$result['success']) {
+            $auth->auditCurrent('FLATTEN_FAILED', implode(' ', $result['errors']));
+            setFlash('Flattening failed: ' . implode(' ', $result['errors']), 'error');
+            header('Location: index.php');
+            exit;
+        }
+
+        $s = $db->prepare("SELECT domain FROM domains WHERE id = ?");
+        $s->execute([$domainId]);
+        $name = $s->fetchColumn();
+
+        $msg = "Flattened {$name}: " . count($result['ips_collected']) . ' IP(s), '
+             . $result['lookup_count_before'] . ' lookup(s) → 0.';
+
+        $auth->auditCurrent('SPF_FLATTENED', $msg, $name);
+
+        if ($push && $name) {
             try {
-                $stmt = $db->prepare("DELETE FROM domains WHERE id = ?");
-                $stmt->execute([$domainId]);
-                $message = "Domain deleted successfully";
-                $messageType = 'success';
+                $cf = new CloudflareAPI();
+                $cf->updateDomainSPF($name, $result['flattened_record']);
+                $auth->auditCurrent('CLOUDFLARE_PUSHED', "Published flattened SPF for {$name}", $name);
+                $msg .= ' Published to Cloudflare.';
             } catch (Exception $e) {
-                $message = "Error deleting domain: " . $e->getMessage();
-                $messageType = 'error';
+                error_log('Cloudflare push failed: ' . $e->getMessage());
+                $auth->auditCurrent('CLOUDFLARE_PUSH_FAILED', $e->getMessage(), $name);
+                setFlash($msg . ' Cloudflare publish failed.', 'warning');
+                header('Location: index.php');
+                exit;
             }
         }
+
+        setFlash($msg, 'success');
+        header('Location: index.php');
+        exit;
+    }
+
+    /* ---- Configuration ---- */
+    if ($action === 'save_config') {
+        if (!$auth->isAdmin()) {
+            setFlash('Only administrators can change settings.', 'error');
+            header('Location: index.php#config');
+            exit;
+        }
+
+        $allowed = ['cloudflare_api_email', 'cloudflare_api_key', 'smtp_server',
+                    'smtp_port', 'smtp_from_email', 'smtp_from_name',
+                    'smtp_username', 'smtp_password', 'enable_email_notifications'];
+
+        $saved = 0;
+        foreach ($allowed as $key) {
+            if (!isset($_POST[$key])) {
+                continue;
+            }
+            $value = trim((string) $_POST[$key]);
+
+            // Skip blank secrets so they aren't wiped by an empty submit.
+            if (in_array($key, ['cloudflare_api_key', 'smtp_password'], true) && $value === '') {
+                continue;
+            }
+            if ($key === 'smtp_from_email' && $value !== '' && !isValidEmail($value)) {
+                setFlash('That email address is not valid.', 'error');
+                header('Location: index.php#config');
+                exit;
+            }
+            if ($key === 'cloudflare_api_email' && $value !== '' && !isValidEmail($value)) {
+                setFlash('That Cloudflare email address is not valid.', 'error');
+                header('Location: index.php#config');
+                exit;
+            }
+            if ($key === 'smtp_port') {
+                $value = (string) sanitizeInt($value, 587);
+            }
+
+            $stmt = $db->prepare("
+                INSERT INTO config (config_key, config_value) VALUES (?, ?)
+                ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)
+            ");
+            $stmt->execute([$key, sanitizeString($value, 500)]);
+            $saved++;
+        }
+
+        $auth->auditCurrent('CONFIG_UPDATED', "Updated {$saved} setting(s)");
+        setFlash('Saved the settings.', 'success');
+        header('Location: index.php#config');
+        exit;
     }
 }
 
-// Get all domains
-$domainsStmt = $db->query("
-    SELECT d.*, 
-           (SELECT COUNT(*) FROM sending_domains sd WHERE sd.domain_id = d.id) as sender_count,
-           (SELECT COUNT(*) FROM flattened_ips fi WHERE fi.domain_id = d.id AND fi.is_active = 1) as ip_count
-    FROM domains d 
-    ORDER BY d.created_at DESC
-");
-$domains = $domainsStmt->fetchAll();
+/* ------------------------------------------------------------
+ * Data for the view
+ * ---------------------------------------------------------- */
+$domains = $db->query("
+    SELECT d.*,
+           (SELECT COUNT(*) FROM sending_domains sd WHERE sd.domain_id = d.id) AS sender_count,
+           (SELECT COUNT(*) FROM flattened_ips fi WHERE fi.domain_id = d.id AND fi.is_active = 1) AS ip_count
+      FROM domains d
+     ORDER BY d.created_at DESC
+")->fetchAll();
 
-// Get approved senders for each domain
 $sendersByDomain = [];
-$sendersStmt = $db->query("
-    SELECT sd.domain_id, sd.sending_domain, sd.id as sending_domain_id,
-           asp.sender_name, asp.include_domain, asp.id as sender_id
-    FROM sending_domains sd
-    LEFT JOIN approved_senders asp ON sd.id = asp.sending_domain_id AND asp.is_active = 1
-    ORDER BY sd.domain_id, sd.sending_domain
-");
-while ($row = $sendersStmt->fetch()) {
-    $domainId = $row['domain_id'];
-    if (!isset($sendersByDomain[$domainId])) {
-        $sendersByDomain[$domainId] = [];
-    }
-    $sendersByDomain[$domainId][] = $row;
+$rows = $db->query("
+    SELECT sd.domain_id, sd.sending_domain, asp.sender_name, asp.include_domain, asp.id AS sender_id
+      FROM sending_domains sd
+      LEFT JOIN approved_senders asp
+             ON sd.id = asp.sending_domain_id AND asp.is_active = 1
+     ORDER BY sd.domain_id, sd.sending_domain, asp.sender_name
+")->fetchAll();
+
+foreach ($rows as $row) {
+    $sendersByDomain[$row['domain_id']][] = $row;
 }
 
+$config = [];
+foreach ($db->query("SELECT config_key, config_value FROM config")->fetchAll() as $c) {
+    $config[$c['config_key']] = $c['config_value'];
+}
+
+$totalIps      = array_sum(array_column($domains, 'ip_count'));
+$overLimit     = count(array_filter($domains, fn($d) => $d['lookup_count_before'] > MAX_DNS_LOOKUPS));
+$lookupsSaved  = array_sum(array_map(fn($d) => max(0, $d['lookup_count_before'] - $d['lookup_count_after']), $domains));
+$csrf          = generateCSRFToken();
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SPF Flattener - Dashboard</title>
-    <style>
-        :root {
-            --primary: #3b82f6;
-            --success: #10b981;
-            --warning: #f59e0b;
-            --danger: #ef4444;
-            --dark: #1f2937;
-            --light: #f3f4f6;
-            --border: #e5e7eb;
-        }
-        
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: var(--light);
-            color: var(--dark);
-            line-height: 1.6;
-        }
-        
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        
-        header {
-            background: white;
-            padding: 20px;
-            margin-bottom: 20px;
-            border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        
-        header h1 {
-            color: var(--primary);
-            margin-bottom: 5px;
-        }
-        
-        .alert {
-            padding: 15px 20px;
-            border-radius: 6px;
-            margin-bottom: 20px;
-        }
-        
-        .alert-success { background: #d1fae5; color: #065f46; border: 1px solid var(--success); }
-        .alert-error { background: #fee2e2; color: #991b1b; border: 1px solid var(--danger); }
-        .alert-warning { background: #fef3c7; color: #92400e; border: 1px solid var(--warning); }
-        
-        .card {
-            background: white;
-            border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        
-        .card h2 {
-            margin-bottom: 15px;
-            color: var(--dark);
-            border-bottom: 2px solid var(--border);
-            padding-bottom: 10px;
-        }
-        
-        .btn {
-            display: inline-block;
-            padding: 10px 20px;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
-            text-decoration: none;
-            transition: opacity 0.2s;
-        }
-        
-        .btn:hover { opacity: 0.9; }
-        .btn-primary { background: var(--primary); color: white; }
-        .btn-success { background: var(--success); color: white; }
-        .btn-danger { background: var(--danger); color: white; }
-        .btn-secondary { background: #6b7280; color: white; }
-        .btn-sm { padding: 6px 12px; font-size: 13px; }
-        
-        .form-group {
-            margin-bottom: 15px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: 500;
-        }
-        
-        .form-group input, .form-group select, .form-group textarea {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            font-size: 14px;
-        }
-        
-        .form-row {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-        }
-        
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-        
-        th, td {
-            padding: 12px;
-            text-align: left;
-            border-bottom: 1px solid var(--border);
-        }
-        
-        th {
-            background: var(--light);
-            font-weight: 600;
-        }
-        
-        tr:hover {
-            background: #f9fafb;
-        }
-        
-        .badge {
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: 500;
-        }
-        
-        .badge-success { background: #d1fae5; color: #065f46; }
-        .badge-warning { background: #fef3c7; color: #92400e; }
-        .badge-danger { background: #fee2e2; color: #991b1b; }
-        .badge-info { background: #dbeafe; color: #1e40af; }
-        
-        .spf-record {
-            font-family: 'Courier New', monospace;
-            background: #f4f4f4;
-            padding: 10px;
-            border-radius: 4px;
-            word-break: break-all;
-            font-size: 13px;
-        }
-        
-        .tabs {
-            display: flex;
-            border-bottom: 2px solid var(--border);
-            margin-bottom: 20px;
-        }
-        
-        .tab {
-            padding: 10px 20px;
-            cursor: pointer;
-            border-bottom: 2px solid transparent;
-            margin-bottom: -2px;
-        }
-        
-        .tab.active {
-            border-bottom-color: var(--primary);
-            color: var(--primary);
-            font-weight: 600;
-        }
-        
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-        
-        .grid-2 {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-            gap: 20px;
-        }
-        
-        .stat-box {
-            background: var(--light);
-            padding: 15px;
-            border-radius: 6px;
-            text-align: center;
-        }
-        
-        .stat-box h3 { font-size: 24px; color: var(--primary); }
-        .stat-box p { color: #6b7280; font-size: 14px; }
-        
-        .collapsible {
-            cursor: pointer;
-            padding: 10px;
-            background: var(--light);
-            border-radius: 4px;
-            margin: 5px 0;
-        }
-        
-        .collapsible:hover { background: #e5e7eb; }
-        
-        .collapsible-content {
-            display: none;
-            padding: 10px;
-            border-left: 3px solid var(--primary);
-            margin-left: 10px;
-        }
-        
-        .collapsible-content.show { display: block; }
-        
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        
-        .checkbox-group input[type="checkbox"] {
-            width: auto;
-        }
-        
-        #dns-test-result {
-            margin-top: 15px;
-            padding: 15px;
-            background: var(--light);
-            border-radius: 6px;
-            display: none;
-        }
-        
-        #dns-test-result.show { display: block; }
-        
-        .spf-preview {
-            background: #1f2937;
-            color: #10b981;
-            padding: 15px;
-            border-radius: 6px;
-            font-family: 'Courier New', monospace;
-            word-break: break-all;
-            margin-top: 10px;
-        }
-        
-        .mechanism-list {
-            margin-top: 10px;
-        }
-        
-        .mechanism-item {
-            padding: 5px 10px;
-            background: var(--light);
-            border-radius: 4px;
-            margin: 5px 0;
-            font-size: 13px;
-        }
-        
-        .import-status {
-            padding: 10px;
-            border-radius: 6px;
-            margin-top: 10px;
-        }
-        
-        .import-status.success { background: #d1fae5; color: #065f46; }
-        .import-status.error { background: #fee2e2; color: #991b1b; }
-    </style>
+    <?php renderHead('Dashboard'); ?>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>🛡️ SPF Flattener</h1>
-            <p>Manage and flatten SPF records to stay under the 10-lookup limit</p>
-        </header>
-        
-        <?php if ($message): ?>
-            <div class="alert alert-<?= $messageType ?>"><?= htmlspecialchars($message) ?></div>
-        <?php endif; ?>
-        
-        <div class="card">
-            <div class="grid-2">
-                <div class="stat-box">
-                    <h3><?= count($domains) ?></h3>
-                    <p>Domains Configured</p>
-                </div>
-                <div class="stat-box">
-                    <h3>
-                        <?php
-                        $totalIps = 0;
-                        foreach ($domains as $d) { $totalIps += $d['ip_count']; }
-                        echo $totalIps;
-                        ?>
-                    </h3>
-                    <p>Total Flattened IPs</p>
-                </div>
-            </div>
-        </div>
-        
-        <div class="tabs">
-            <div class="tab active" onclick="showTab('domains')">Domains</div>
-            <div class="tab" onclick="showTab('add-domain')">Add Domain</div>
-            <div class="tab" onclick="showTab('senders')">Approved Senders</div>
-            <div class="tab" onclick="showTab('config')">Configuration</div>
-        </div>
-        
-        <div id="domains" class="tab-content active">
-            <div class="card">
-                <h2>Configured Domains</h2>
-                
-                <?php if (empty($domains)): ?>
-                    <p>No domains configured yet. Click "Add Domain" to get started.</p>
-                <?php else: ?>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Domain</th>
-                                <th>Senders</th>
-                                <th>Flattened IPs</th>
-                                <th>Lookups Before</th>
-                                <th>Last Flattened</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($domains as $domain): ?>
-                                <tr>
-                                    <td>
-                                        <strong><?= htmlspecialchars($domain['domain']) ?></strong>
-                                        <?php if ($domain['cloudflare_zone_id']): ?>
-                                            <span class="badge badge-info">Cloudflare</span>
-                                        <?php endif; ?>
-                                    </td>
-                                    <td><?= $domain['sender_count'] ?></td>
-                                    <td><?= $domain['ip_count'] ?></td>
-                                    <td>
-                                        <?php if ($domain['lookup_count_before'] > 10): ?>
-                                            <span class="badge badge-danger"><?= $domain['lookup_count_before'] ?> (Over limit!)</span>
-                                        <?php else: ?>
-                                            <span class="badge badge-success"><?= $domain['lookup_count_before'] ?></span>
-                                        <?php endif; ?>
-                                    </td>
-                                    <td><?= $domain['last_flattened_at'] ? date('Y-m-d H:i', strtotime($domain['last_flattened_at'])) : 'Never' ?></td>
-                                    <td>
-                                        <form method="POST" style="display: inline;">
-                                            <input type="hidden" name="action" value="flatten">
-                                            <input type="hidden" name="domain_id" value="<?= $domain['id'] ?>">
-                                            <button type="submit" class="btn btn-primary btn-sm">⚡ Flatten</button>
-                                        </form>
-                                        
-                                        <?php if ($domain['flattened_spf_record']): ?>
-                                            <button class="btn btn-sm" onclick="toggleRecord(<?= $domain['id'] ?>)">📋 View</button>
-                                        <?php endif; ?>
-                                        
-                                        <form method="POST" style="display: inline;" onsubmit="return confirm('Delete this domain?')">
-                                            <input type="hidden" name="action" value="delete_domain">
-                                            <input type="hidden" name="domain_id" value="<?= $domain['id'] ?>">
-                                            <button type="submit" class="btn btn-danger btn-sm">🗑️</button>
-                                        </form>
-                                        
-                                        <?php if ($domain['flattened_spf_record']): ?>
-                                            <div id="record-<?= $domain['id'] ?>" class="collapsible-content">
-                                                <div class="spf-record"><?= htmlspecialchars($domain['flattened_spf_record']) ?></div>
-                                            </div>
-                                        <?php endif; ?>
-                                    </td>
-                                </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                <?php endif; ?>
-            </div>
-        </div>
-        
-        <div id="add-domain" class="tab-content">
-            <div class="card">
-                <h2>Add New Domain</h2>
-                
-                <div class="grid-2">
-                    <div>
-                        <h3>📥 Import from DNS</h3>
-                        <p style="margin-bottom: 15px; color: #6b7280; font-size: 14px;">
-                            Automatically fetch and parse your existing SPF record from DNS
-                        </p>
-                        <form id="import-form" onsubmit="return false;">
-                            <div class="form-group">
-                                <label for="import_domain">Domain Name *</label>
-                                <input type="text" id="import_domain" placeholder="example.com" required>
-                            </div>
-                            <div class="form-group">
-                                <label for="import_cloudflare_zone_id">Cloudflare Zone ID (optional)</label>
-                                <input type="text" id="import_cloudflare_zone_id" placeholder="Leave empty if not using Cloudflare">
-                            </div>
-                            <button type="button" class="btn btn-secondary" onclick="testDNS()">🔍 Test DNS Lookup</button>
-                            <button type="button" class="btn btn-primary" onclick="fetchSPF()">📡 Fetch SPF Record</button>
-                            <button type="button" class="btn btn-success" onclick="importSPF()" id="import_btn" style="display:none;">➕ Import & Add Domain</button>
-                            
-                            <div id="dns-test-result"></div>
-                        </form>
-                    </div>
-                    
-                    <div>
-                        <h3>✏️ Add Manually</h3>
-                        <form method="POST">
-                            <input type="hidden" name="action" value="add_domain">
-                            <div class="form-group">
-                                <label for="domain">Domain Name *</label>
-                                <input type="text" id="domain" name="domain" placeholder="example.com" required>
-                            </div>
-                            <div class="form-group">
-                                <label for="cloudflare_zone_id">Cloudflare Zone ID (optional)</label>
-                                <input type="text" id="cloudflare_zone_id" name="cloudflare_zone_id" placeholder="Leave empty if not using Cloudflare">
-                            </div>
-                            <div class="form-group checkbox-group">
-                                <input type="checkbox" id="import_spf" name="import_spf" value="1">
-                                <label for="import_spf">Import SPF record from DNS after adding</label>
-                            </div>
-                            <button type="submit" class="btn btn-primary">➕ Add Domain</button>
-                        </form>
-                    </div>
-                </div>
-            </div>
-        </div>
-        
-        <div id="senders" class="tab-content">
-            <div class="card">
-                <h2>Approved Senders</h2>
-                
-                <div class="grid-2">
-                    <div>
-                        <h3>Add Approved Sender</h3>
-                        <form method="POST">
-                            <input type="hidden" name="action" value="add_sender">
-                            <div class="form-group">
-                                <label for="domain_id">Domain *</label>
-                                <select id="domain_id" name="domain_id" required>
-                                    <option value="">Select domain...</option>
-                                    <?php foreach ($domains as $d): ?>
-                                        <option value="<?= $d['id'] ?>"><?= htmlspecialchars($d['domain']) ?></option>
-                                    <?php endforeach; ?>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <label for="sending_domain">Sending Domain *</label>
-                                <input type="text" id="sending_domain" name="sending_domain" placeholder="mail.example.com" required>
-                            </div>
-                            <div class="form-group">
-                                <label for="sender_name">Sender Name *</label>
-                                <input type="text" id="sender_name" name="sender_name" placeholder="Google Workspace" required>
-                            </div>
-                            <div class="form-group">
-                                <label for="include_domain">Include Domain (SPF mechanism) *</label>
-                                <input type="text" id="include_domain" name="include_domain" placeholder="_spf.google.com" required>
-                            </div>
-                            <button type="submit" class="btn btn-primary">➕ Add Sender</button>
-                        </form>
-                    </div>
-                    
-                    <div>
-                        <h3>Current Senders</h3>
-                        <?php foreach ($sendersByDomain as $domainId => $senders): ?>
-                            <div class="collapsible" onclick="toggleSender(this)">
-                                <strong><?= htmlspecialchars($domains[array_search($domainId, array_column($domains, 'id'))]['domain']) ?></strong>
-                                (<?= count($senders) ?> senders)
-                            </div>
-                            <div class="collapsible-content">
-                                <table>
-                                    <thead>
-                                        <tr>
-                                            <th>Sender</th>
-                                            <th>Include Domain</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        <?php foreach ($senders as $sender): ?>
-                                            <tr>
-                                                <td><?= htmlspecialchars($sender['sender_name']) ?></td>
-                                                <td><code><?= htmlspecialchars($sender['include_domain']) ?></code></td>
-                                            </tr>
-                                        <?php endforeach; ?>
-                                    </tbody>
-                                </table>
-                            </div>
-                        <?php endforeach; ?>
-                    </div>
-                </div>
-            </div>
-        </div>
-        
-        <div id="config" class="tab-content">
-            <div class="card">
-                <h2>Configuration</h2>
-                
-                <div class="form-group">
-                    <h3>Cloudflare Integration</h3>
-                    <p>Enable automatic SPF record updates in Cloudflare DNS</p>
-                    <form method="POST" action="save_config.php">
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label>Cloudflare API Email</label>
-                                <input type="email" name="cloudflare_api_email" value="">
-                            </div>
-                            <div class="form-group">
-                                <label>Cloudflare API Key</label>
-                                <input type="password" name="cloudflare_api_key">
-                            </div>
-                        </div>
-                        <button type="submit" class="btn btn-primary">Save Cloudflare Settings</button>
-                    </form>
-                </div>
-                
-                <div class="form-group">
-                    <h3>Email Notifications</h3>
-                    <p>Get notified when SPF records change</p>
-                    <form method="POST" action="save_config.php">
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label>SMTP Server</label>
-                                <input type="text" name="smtp_server">
-                            </div>
-                            <div class="form-group">
-                                <label>SMTP Port</label>
-                                <input type="number" name="smtp_port" value="587">
-                            </div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label>From Email</label>
-                                <input type="email" name="smtp_from_email">
-                            </div>
-                            <div class="form-group">
-                                <label>From Name</label>
-                                <input type="text" name="smtp_from_name" value="SPF Flattener">
-                            </div>
-                        </div>
-                        <button type="submit" class="btn btn-primary">Save Email Settings</button>
-                    </form>
-                </div>
-            </div>
-        </div>
+<?php renderHeader($auth, 'domains'); ?>
+
+<?php renderHero(
+    'SPF Flattening Console',
+    'Resolve include: chains into direct ip4: / ip6: entries and keep every zone inside the RFC 7208 lookup limit.',
+    'Mail Authentication'
+); ?>
+
+<div class="container container--wide section">
+  <?php renderFlash(); ?>
+
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="stat-card__value"><?= count($domains) ?></div>
+      <div class="stat-card__label">Domains</div>
+      <div class="stat-card__sub">Monitored zones</div>
     </div>
-    
-    <script>
-        function showTab(tabId) {
-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            
-            event.target.classList.add('active');
-            document.getElementById(tabId).classList.add('active');
-        }
-        
-        function toggleRecord(domainId) {
-            const content = document.getElementById('record-' + domainId);
-            content.classList.toggle('show');
-        }
-        
-        function toggleSender(element) {
-            const content = element.nextElementSibling;
-            content.classList.toggle('show');
-        }
-        
-        async function testDNS() {
-            const domain = document.getElementById('import_domain').value.trim();
-            if (!domain) {
-                alert('Please enter a domain name');
-                return;
-            }
-            
-            const resultDiv = document.getElementById('dns-test-result');
-            resultDiv.innerHTML = 'Testing DNS lookup...';
-            resultDiv.classList.add('show');
-            
-            const formData = new FormData();
-            formData.append('action', 'test_dns');
-            formData.append('domain', domain);
-            
-            try {
-                const response = await fetch('import_spf.php', {
-                    method: 'POST',
-                    body: formData
-                });
-                const result = await response.json();
-                
-                if (result.success) {
-                    resultDiv.className = 'import-status success';
-                    resultDiv.innerHTML = '<strong>✓ DNS lookup successful!</strong><br>' +
-                        'Found ' + result.txt_records.length + ' TXT record(s)';
-                } else {
-                    resultDiv.className = 'import-status error';
-                    resultDiv.innerHTML = '<strong>✗ DNS lookup failed</strong><br>' + 
-                        (result.errors ? result.errors.join('<br>') : result.error);
-                }
-            } catch (e) {
-                resultDiv.className = 'import-status error';
-                resultDiv.innerHTML = '<strong>✗ Error:</strong> ' + e.message;
-            }
-        }
-        
-        async function fetchSPF() {
-            const domain = document.getElementById('import_domain').value.trim();
-            if (!domain) {
-                alert('Please enter a domain name');
-                return;
-            }
-            
-            const resultDiv = document.getElementById('dns-test-result');
-            resultDiv.innerHTML = 'Fetching SPF record...';
-            resultDiv.classList.add('show');
-            
-            const formData = new FormData();
-            formData.append('action', 'fetch_spf');
-            formData.append('domain', domain);
-            
-            try {
-                const response = await fetch('import_spf.php', {
-                    method: 'POST',
-                    body: formData
-                });
-                const result = await response.json();
-                
-                if (result.success) {
-                    resultDiv.className = 'import-status success';
-                    
-                    let html = '<strong>✓ SPF record found!</strong><br><br>';
-                    html += '<strong>Original Record:</strong><br>';
-                    html += '<div class="spf-preview">' + result.spf_record + '</div><br>';
-                    html += '<strong>Lookup Count:</strong> ' + result.lookup_count + ' ';
-                    html += result.lookup_count > 10 ? '<span class="badge badge-danger">(Over 10 limit!)</span>' : '<span class="badge badge-success">(Under limit)</span>';
-                    html += '<br><br>';
-                    
-                    if (result.includes.length > 0) {
-                        html += '<strong>Include Mechanisms Found (' + result.includes.length + '):</strong>';
-                        html += '<div class="mechanism-list">';
-                        result.includes.forEach(include => {
-                            html += '<div class="mechanism-item">📧 include:' + include + '</div>';
-                        });
-                        html += '</div>';
-                    }
-                    
-                    if (result.ip4.length > 0) {
-                        html += '<br><strong>Direct IPv4 Entries (' + result.ip4.length + '):</strong><br>';
-                        result.ip4.forEach(ip => {
-                            html += '<div class="mechanism-item">🌐 ip4:' + ip + '</div>';
-                        });
-                    }
-                    
-                    if (result.has_a) html += '<br>⚠️ Has A mechanism (causes DNS lookup)';
-                    if (result.has_mx) html += '<br>⚠️ Has MX mechanism (causes DNS lookup)';
-                    if (result.redirect) html += '<br>🔄 Redirects to: ' + result.redirect;
-                    
-                    resultDiv.innerHTML = html;
-                    document.getElementById('import_btn').style.display = 'inline-block';
-                } else {
-                    resultDiv.className = 'import-status error';
-                    resultDiv.innerHTML = '<strong>✗ No SPF record found</strong><br>' + 
-                        (result.error || 'The domain has no SPF record published in DNS.');
-                    document.getElementById('import_btn').style.display = 'none';
-                }
-            } catch (e) {
-                resultDiv.className = 'import-status error';
-                resultDiv.innerHTML = '<strong>✗ Error:</strong> ' + e.message;
-                document.getElementById('import_btn').style.display = 'none';
-            }
-        }
-        
-        async function importSPF() {
-            const domain = document.getElementById('import_domain').value.trim();
-            const cloudflareZoneId = document.getElementById('import_cloudflare_zone_id').value.trim();
-            
-            if (!domain) {
-                alert('Please enter a domain name');
-                return;
-            }
-            
-            const resultDiv = document.getElementById('dns-test-result');
-            resultDiv.innerHTML = 'Importing SPF record...';
-            
-            const formData = new FormData();
-            formData.append('action', 'add_and_import');
-            formData.append('domain', domain);
-            formData.append('cloudflare_zone_id', cloudflareZoneId);
-            
-            try {
-                const response = await fetch('import_spf.php', {
-                    method: 'POST',
-                    body: formData
-                });
-                const result = await response.json();
-                
-                if (result.success) {
-                    resultDiv.className = 'import-status success';
-                    resultDiv.innerHTML = '<strong>✓ Import successful!</strong><br>' +
-                        (result.import_summary || 'Added ' + result.senders_added + ' sender(s) automatically.') + '<br>' +
-                        'Redirecting to domains list...';
-                    
-                    setTimeout(() => {
-                        window.location.href = 'index.php';
-                    }, 2000);
-                } else {
-                    resultDiv.className = 'import-status error';
-                    resultDiv.innerHTML = '<strong>✗ Import failed</strong><br>' + 
-                        (result.errors ? result.errors.join('<br>') : result.error);
-                }
-            } catch (e) {
-                resultDiv.className = 'import-status error';
-                resultDiv.innerHTML = '<strong>✗ Error:</strong> ' + e.message;
-            }
-        }
-    </script>
+    <div class="stat-card">
+      <div class="stat-card__value"><?= $totalIps ?></div>
+      <div class="stat-card__label">Flattened IPs</div>
+      <div class="stat-card__sub">Across all zones</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-card__value"><?= $lookupsSaved ?></div>
+      <div class="stat-card__label">Lookups Saved</div>
+      <div class="stat-card__sub">DNS queries avoided</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-card__value" style="color: <?= $overLimit ? 'var(--danger)' : 'var(--ok)' ?>"><?= $overLimit ?></div>
+      <div class="stat-card__label">Over Limit</div>
+      <div class="stat-card__sub">Zones above <?= MAX_DNS_LOOKUPS ?> lookups</div>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" onclick="showTab('tab-domains', this)">Domains</button>
+    <button class="tab" onclick="showTab('tab-add', this)">Add Domain</button>
+    <button class="tab" onclick="showTab('tab-senders', this)">Senders</button>
+    <button class="tab" onclick="showTab('tab-config', this)">Settings</button>
+  </div>
+
+  <!-- DOMAINS -------------------------------------------------->
+  <div id="tab-domains" class="tab-content active">
+    <div class="card">
+      <div class="card__head">
+        <div>
+          <div class="card__title">Configured Domains</div>
+          <div class="card__sub">Flatten, inspect and publish SPF records</div>
+        </div>
+      </div>
+
+      <?php if (empty($domains)): ?>
+        <div class="empty">
+          <div class="empty__icon">◎</div>
+          <div class="empty__title">No domains yet</div>
+          <p>Use <strong>Add Domain</strong> to import an existing SPF record from DNS.</p>
+        </div>
+      <?php else: ?>
+        <div class="table-wrap">
+          <table class="data">
+            <thead>
+              <tr>
+                <th>Domain</th>
+                <th>Senders</th>
+                <th>IPs</th>
+                <th>Lookups</th>
+                <th>Last Flattened</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <?php foreach ($domains as $d): ?>
+                <tr>
+                  <td>
+                    <strong><?= htmlspecialchars($d['domain']) ?></strong><br>
+                    <?php if ($d['cloudflare_zone_id']): ?>
+                      <span class="badge badge-info">Cloudflare</span>
+                    <?php endif; ?>
+                    <?php if (!$d['is_active']): ?>
+                      <span class="badge badge-neutral">Inactive</span>
+                    <?php endif; ?>
+                  </td>
+                  <td><?= (int) $d['sender_count'] ?></td>
+                  <td><?= (int) $d['ip_count'] ?></td>
+                  <td>
+                    <?php if ($d['lookup_count_before'] > MAX_DNS_LOOKUPS): ?>
+                      <span class="badge badge-danger"><?= (int) $d['lookup_count_before'] ?> over</span>
+                    <?php else: ?>
+                      <span class="badge badge-ok"><?= (int) $d['lookup_count_before'] ?></span>
+                    <?php endif; ?>
+                  </td>
+                  <td class="muted" style="font-size:13px">
+                    <?= $d['last_flattened_at'] ? htmlspecialchars(date('Y-m-d H:i', strtotime($d['last_flattened_at']))) : '—' ?>
+                  </td>
+                  <td>
+                    <div class="cell-actions">
+                      <?php if ($canWrite): ?>
+                      <form method="post" style="display:inline">
+                        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf) ?>">
+                        <input type="hidden" name="action" value="flatten">
+                        <input type="hidden" name="domain_id" value="<?= (int) $d['id'] ?>">
+                        <button class="btn btn-primary btn-sm" type="submit">Flatten</button>
+                      </form>
+                      <?php endif; ?>
+
+                      <?php if ($d['flattened_spf_record']): ?>
+                        <button class="btn btn-outline btn-sm"
+                                onclick="toggleCollapse(this)">View<span class="collapsible__chev">›</span></button>
+                      <?php endif; ?>
+
+                      <?php if ($canWrite): ?>
+                      <form method="post" style="display:inline"
+                            onsubmit="return confirm('Delete <?= htmlspecialchars($d['domain'], ENT_QUOTES) ?> and all of its records?')">
+                        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf) ?>">
+                        <input type="hidden" name="action" value="delete_domain">
+                        <input type="hidden" name="domain_id" value="<?= (int) $d['id'] ?>">
+                        <button class="btn btn-danger btn-sm" type="submit">Delete</button>
+                      </form>
+                      <?php endif; ?>
+                    </div>
+
+                    <?php if ($d['flattened_spf_record']): ?>
+                      <div class="collapsible-body">
+                        <div class="flex-between mb-8">
+                          <span class="muted" style="font-size:12px">Flattened SPF record</span>
+                          <button class="btn btn-outline btn-sm" type="button"
+                                  onclick="copyText(<?= htmlspecialchars(json_encode($d['flattened_spf_record']), ENT_QUOTES) ?>, this)">Copy</button>
+                        </div>
+                        <div class="spf-record"><?= htmlspecialchars($d['flattened_spf_record']) ?></div>
+
+                        <?php if (!empty($d['original_spf_record'])): ?>
+                          <p class="form-hint mt-8">Original</p>
+                          <div class="spf-record spf-record--light"><?= htmlspecialchars($d['original_spf_record']) ?></div>
+                        <?php endif; ?>
+                      </div>
+                    <?php endif; ?>
+                  </td>
+                </tr>
+              <?php endforeach; ?>
+            </tbody>
+          </table>
+        </div>
+      <?php endif; ?>
+    </div>
+  </div>
+
+  <!-- ADD ------------------------------------------------------>
+  <div id="tab-add" class="tab-content">
+    <div class="grid-2">
+      <?php if ($canWrite): ?>
+      <div class="card">
+        <div class="card__head">
+          <div>
+            <div class="card__title">Import from DNS</div>
+            <div class="card__sub">Fetch and parse the live SPF record automatically</div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="import_domain">Domain <span class="req">*</span></label>
+          <input class="form-input" type="text" id="import_domain" placeholder="example.com">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="import_zone">Cloudflare Zone ID <span class="muted">(optional)</span></label>
+          <input class="form-input" type="text" id="import_zone" placeholder="Leave blank if not using Cloudflare">
+        </div>
+
+        <div class="flex-between">
+          <button class="btn btn-outline" type="button" onclick="fetchSPF()">Fetch SPF</button>
+          <button class="btn btn-primary" type="button" id="importBtn" onclick="importSPF()" disabled>Import &amp; Add</button>
+        </div>
+
+        <div id="spfPreview" class="mt-16 hidden"></div>
+      </div>
+      <?php endif; ?>
+
+      <?php if ($canWrite): ?>
+      <div class="card">
+        <div class="card__head">
+          <div>
+            <div class="card__title">Add Manually</div>
+            <div class="card__sub">Enter a domain without importing</div>
+          </div>
+        </div>
+        <form method="post">
+          <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf) ?>">
+          <input type="hidden" name="action" value="add_domain">
+          <div class="form-group">
+            <label class="form-label" for="domain">Domain <span class="req">*</span></label>
+            <input class="form-input" type="text" id="domain" name="domain" placeholder="example.com" required>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="zone">Cloudflare Zone ID</label>
+            <input class="form-input" type="text" id="zone" name="cloudflare_zone_id" placeholder="Optional">
+          </div>
+          <div class="form-group form-check">
+            <input type="checkbox" id="import_spf" name="import_spf" value="1" checked>
+            <label for="import_spf">Import the SPF record from DNS after adding</label>
+          </div>
+          <button class="btn btn-primary" type="submit">Add Domain</button>
+        </form>
+      </div>
+      <?php endif; ?>
+    </div>
+  </div>
+
+  <!-- SENDERS -------------------------------------------------->
+  <div id="tab-senders" class="tab-content">
+    <div class="grid-2">
+      <?php if ($canWrite): ?>
+      <div class="card">
+        <div class="card__head">
+          <div class="card__title">Add Sender</div>
+        </div>
+        <form method="post">
+          <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf) ?>">
+          <input type="hidden" name="action" value="add_sender">
+
+          <div class="form-group">
+            <label class="form-label" for="s_domain">Domain <span class="req">*</span></label>
+            <select class="form-select" id="s_domain" name="domain_id" required>
+              <option value="">Select a domain…</option>
+              <?php foreach ($domains as $d): ?>
+                <option value="<?= (int) $d['id'] ?>"><?= htmlspecialchars($d['domain']) ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="s_sending">Sending Domain <span class="req">*</span></label>
+            <input class="form-input" type="text" id="s_sending" name="sending_domain" placeholder="example.com" required>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="s_name">Sender Name <span class="req">*</span></label>
+            <input class="form-input" type="text" id="s_name" name="sender_name" placeholder="Google Workspace" required>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="s_include">Include Domain or IP <span class="req">*</span></label>
+            <input class="form-input" type="text" id="s_include" name="include_domain" placeholder="_spf.google.com or ip4:203.0.113.0/24" required>
+            <div class="form-hint">An include domain, or a direct <span class="inline-code">ip4:</span>/<span class="inline-code">ip6:</span> entry.</div>
+          </div>
+          <button class="btn btn-primary" type="submit">Add Sender</button>
+        </form>
+      </div>
+      <?php endif; ?>
+
+      <div class="card">
+        <div class="card__head">
+          <div class="card__title">Current Senders</div>
+        </div>
+
+        <?php if (empty($sendersByDomain)): ?>
+          <div class="empty">
+            <div class="empty__icon">◎</div>
+            <div class="empty__title">No senders configured</div>
+            <p>Import a domain's SPF record, or add senders manually.</p>
+          </div>
+        <?php else: ?>
+          <?php foreach ($sendersByDomain as $domainId => $senders):
+              $parent = '';
+              foreach ($domains as $d) { if ((int) $d['id'] === (int) $domainId) { $parent = $d['domain']; break; } }
+              $real = array_filter($senders, fn($s) => $s['sender_id'] !== null);
+          ?>
+            <div class="collapsible" onclick="toggleCollapse(this)">
+              <span><?= htmlspecialchars($parent ?: "Domain #{$domainId}") ?></span>
+              <span class="badge badge-neutral"><?= count($real) ?> sender<?= count($real) === 1 ? '' : 's' ?><span class="collapsible__chev">›</span></span>
+            </div>
+            <div class="collapsible-body">
+              <?php if (empty($real)): ?>
+                <p class="muted" style="font-size:13px">No senders.</p>
+              <?php else: ?>
+                <div class="table-wrap">
+                  <table class="data">
+                    <thead><tr><th>Sender</th><th>Include / IP</th><?php if ($canWrite): ?><th></th><?php endif; ?></tr></thead>
+                    <tbody>
+                      <?php foreach ($real as $s): ?>
+                        <tr>
+                          <td><?= htmlspecialchars($s['sender_name']) ?></td>
+                          <td><span class="inline-code"><?= htmlspecialchars($s['include_domain']) ?></span></td>
+                          <?php if ($canWrite): ?>
+                          <td>
+                            <form method="post" style="display:inline"
+                                  onsubmit="return confirm('Remove this sender?')">
+                              <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf) ?>">
+                              <input type="hidden" name="action" value="delete_sender">
+                              <input type="hidden" name="sender_id" value="<?= (int) $s['sender_id'] ?>">
+                              <button class="btn btn-danger btn-sm" type="submit">Remove</button>
+                            </form>
+                          </td>
+                          <?php endif; ?>
+                        </tr>
+                      <?php endforeach; ?>
+                    </tbody>
+                  </table>
+                </div>
+              <?php endif; ?>
+            </div>
+          <?php endforeach; ?>
+        <?php endif; ?>
+      </div>
+    </div>
+  </div>
+
+  <!-- SETTINGS ------------------------------------------------->
+  <div id="tab-config" class="tab-content">
+    <?php if (!$auth->isAdmin()): ?>
+      <div class="card">
+        <div class="alert alert-info">
+          <span class="alert__icon">i</span>
+          <div>Only administrators can view or change settings.</div>
+        </div>
+      </div>
+    <?php else: ?>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card__head">
+          <div>
+            <div class="card__title">Cloudflare</div>
+            <div class="card__sub">Publish flattened records to Cloudflare DNS</div>
+          </div>
+        </div>
+        <form method="post">
+          <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf) ?>">
+          <input type="hidden" name="action" value="save_config">
+          <div class="form-group">
+            <label class="form-label" for="cf_email">API Email</label>
+            <input class="form-input" type="email" id="cf_email" name="cloudflare_api_email"
+                   value="<?= htmlspecialchars($config['cloudflare_api_email'] ?? '') ?>">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="cf_key">API Key</label>
+            <input class="form-input" type="password" id="cf_key" name="cloudflare_api_key"
+                   placeholder="<?= !empty($config['cloudflare_api_key']) ? '•••••••• (unchanged)' : 'Not set' ?>">
+            <div class="form-hint">Leave blank to keep the current key.</div>
+          </div>
+          <button class="btn btn-primary" type="submit">Save Cloudflare Settings</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <div class="card__head">
+          <div>
+            <div class="card__title">Email Notifications</div>
+            <div class="card__sub">Alert when a sender's IP ranges change</div>
+          </div>
+        </div>
+        <form method="post">
+          <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf) ?>">
+          <input type="hidden" name="action" value="save_config">
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="smtp_server">SMTP Server</label>
+              <input class="form-input" type="text" id="smtp_server" name="smtp_server"
+                     value="<?= htmlspecialchars($config['smtp_server'] ?? '') ?>">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="smtp_port">Port</label>
+              <input class="form-input" type="number" id="smtp_port" name="smtp_port"
+                     value="<?= htmlspecialchars($config['smtp_port'] ?? '587') ?>">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="smtp_from">From Email</label>
+              <input class="form-input" type="email" id="smtp_from" name="smtp_from_email"
+                     value="<?= htmlspecialchars($config['smtp_from_email'] ?? '') ?>">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="smtp_name">From Name</label>
+              <input class="form-input" type="text" id="smtp_name" name="smtp_from_name"
+                     value="<?= htmlspecialchars($config['smtp_from_name'] ?? 'SPF Flattener') ?>">
+            </div>
+          </div>
+          <div class="form-group form-check">
+            <input type="checkbox" id="notify" name="enable_email_notifications" value="1"
+                   <?= ($config['enable_email_notifications'] ?? '0') === '1' ? 'checked' : '' ?>>
+            <label for="notify">Send email notifications on changes</label>
+          </div>
+          <button class="btn btn-primary" type="submit">Save Email Settings</button>
+        </form>
+      </div>
+    </div>
+    <?php endif; ?>
+  </div>
+</div>
+
+<?php renderFooter($user ? 'Signed in as ' . $user['username'] : null); ?>
+<?php renderScripts(); ?>
+
+<script>
+const CSRF = <?= json_encode($csrf) ?>;
+
+async function fetchSPF() {
+  const domain = document.getElementById('import_domain').value.trim();
+  const box = document.getElementById('spfPreview');
+  const btn = document.getElementById('importBtn');
+
+  if (!domain) { alert('Enter a domain name first.'); return; }
+
+  box.className = 'mt-16';
+  box.innerHTML = '<p class="muted">Querying DNS…</p>';
+  btn.disabled = true;
+
+  const fd = new FormData();
+  fd.append('action', 'fetch_spf');
+  fd.append('domain', domain);
+  fd.append('csrf_token', CSRF);
+
+  try {
+    const res = await fetch('import_spf.php', { method: 'POST', body: fd });
+    const out = await res.json();
+
+    if (!out.success) {
+      box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
+        + escapeHtml(out.error || 'No SPF record found.') + '</div></div>';
+      return;
+    }
+
+    let html = '<div class="alert alert-success"><span class="alert__icon">✓</span><div>SPF record found.</div></div>';
+    html += '<p class="form-hint">Original record</p>';
+    html += '<div class="spf-record">' + escapeHtml(out.spf_record) + '</div>';
+
+    html += '<div class="flex-between mt-16">';
+    html += '<span class="muted" style="font-size:13px">DNS lookups</span>';
+    html += out.lookup_count > 10
+      ? '<span class="badge badge-danger">' + out.lookup_count + ' — over limit</span>'
+      : '<span class="badge badge-ok">' + out.lookup_count + '</span>';
+    html += '</div>';
+
+    if (out.includes.length) {
+      html += '<p class="form-hint mt-16">Includes (' + out.includes.length + ')</p><div class="mech-list">';
+      out.includes.forEach(i => {
+        html += '<div class="mech-item mech-item--warn">📧 include:' + escapeHtml(i) + '</div>';
+      });
+      html += '</div>';
+    }
+
+    const ip4 = out.ip4 || [];
+    const ip6 = out.ip6 || [];
+    if (ip4.length) {
+      html += '<p class="form-hint mt-16">Direct IPv4 (' + ip4.length + ')</p><div class="mech-list">';
+      ip4.forEach(i => { html += '<div class="mech-item mech-item--ip4">🌐 ip4:' + escapeHtml(i) + '</div>'; });
+      html += '</div>';
+    }
+    if (ip6.length) {
+      html += '<p class="form-hint mt-16">Direct IPv6 (' + ip6.length + ')</p><div class="mech-list">';
+      ip6.forEach(i => { html += '<div class="mech-item mech-item--ip6">🌐 ip6:' + escapeHtml(i) + '</div>'; });
+      html += '</div>';
+    }
+
+    if (out.has_a)  html += '<p class="form-hint mt-8">⚠ A mechanism present — resolved during flattening.</p>';
+    if (out.has_mx) html += '<p class="form-hint mt-8">⚠ MX mechanism present — resolved during flattening.</p>';
+    if (out.redirect) html += '<p class="form-hint mt-8">↻ Redirects to ' + escapeHtml(out.redirect) + '</p>';
+
+    box.innerHTML = html;
+    btn.disabled = false;
+  } catch (e) {
+    box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
+      + escapeHtml(e.message) + '</div></div>';
+  }
+}
+
+async function importSPF() {
+  const domain = document.getElementById('import_domain').value.trim();
+  const zone = document.getElementById('import_zone').value.trim();
+  const box = document.getElementById('spfPreview');
+
+  if (!domain) { alert('Enter a domain name first.'); return; }
+
+  box.innerHTML = '<p class="muted">Importing…</p>';
+
+  const fd = new FormData();
+  fd.append('action', 'add_and_import');
+  fd.append('domain', domain);
+  fd.append('cloudflare_zone_id', zone);
+  fd.append('csrf_token', CSRF);
+
+  try {
+    const res = await fetch('import_spf.php', { method: 'POST', body: fd });
+    const out = await res.json();
+
+    if (out.success) {
+      box.innerHTML = '<div class="alert alert-success"><span class="alert__icon">✓</span><div>'
+        + escapeHtml(out.import_summary || 'Imported successfully.') + '<br>Reloading…</div></div>';
+      setTimeout(() => { window.location.href = 'index.php'; }, 1600);
+    } else {
+      box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
+        + escapeHtml((out.errors && out.errors.join(' ')) || out.error || 'Import failed.') + '</div></div>';
+    }
+  } catch (e) {
+    box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
+      + escapeHtml(e.message) + '</div></div>';
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+</script>
 </body>
 </html>

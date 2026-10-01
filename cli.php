@@ -18,6 +18,8 @@ chdir(__DIR__);
 
 require_once __DIR__ . '/config/config.php';
 require_once __DIR__ . '/includes/Database.php';
+require_once __DIR__ . '/includes/Security.php';
+require_once __DIR__ . '/includes/Auth.php';
 require_once __DIR__ . '/includes/SPFFlattener.php';
 require_once __DIR__ . '/includes/CloudflareAPI.php';
 require_once __DIR__ . '/includes/DNSLookup.php';
@@ -28,7 +30,29 @@ $dns = new DNSLookup();
 
 // Parse command
 $command = $argv[1] ?? 'help';
-$options = getopt('', ['domain:', 'force', 'no-email', 'set:', 'help']);
+
+/**
+ * Parse "command --flag --key=value" style arguments.
+ * getopt() stops at the first non-option token, which breaks when the
+ * command name precedes the flags, so parse manually.
+ */
+function parseOptions(array $argv) {
+    $opts = [];
+    foreach (array_slice($argv, 2) as $arg) {
+        if (str_starts_with($arg, '--')) {
+            $arg = substr($arg, 2);
+            if (str_contains($arg, '=')) {
+                [$k, $v] = explode('=', $arg, 2);
+                $opts[$k] = $v;
+            } else {
+                $opts[$arg] = true;
+            }
+        }
+    }
+    return $opts;
+}
+
+$options = parseOptions($argv);
 
 switch ($command) {
     case 'flatten':
@@ -53,6 +77,22 @@ switch ($command) {
     
     case 'config':
         cmdConfig($options);
+        break;
+
+    case 'user:add':
+        cmdUserAdd($options);
+        break;
+
+    case 'user:list':
+        cmdUserList();
+        break;
+
+    case 'user:passwd':
+        cmdUserPasswd($options);
+        break;
+
+    case 'audit':
+        cmdAudit($options);
         break;
     
     case 'help':
@@ -397,6 +437,159 @@ function cmdConfig($options) {
     }
 }
 
+function cmdUserAdd($options) {
+    $auth = new Auth();
+
+    $username = $options['username'] ?? null;
+    if (!$username) {
+        echo "Error: --username is required\n";
+        echo "Usage: php cli.php user:add --username=admin [--role=admin] [--email=a@b.c]\n";
+        exit(1);
+    }
+
+    $role = $options['role'] ?? 'admin';
+    $email = $options['email'] ?? null;
+    $name = $options['name'] ?? null;
+
+    // Prefer --password, otherwise prompt without echoing.
+    if (!empty($options['password'])) {
+        $password = $options['password'];
+        $confirm = $password;
+    } else {
+        echo "Password for '{$username}': ";
+        $password = readPassword();
+        echo "\nConfirm password: ";
+        $confirm = readPassword();
+        echo "\n";
+    }
+
+    if ($password !== $confirm) {
+        echo "Error: passwords do not match\n";
+        exit(1);
+    }
+
+    $result = $auth->createUser($username, $password, $role, $email, $name);
+
+    if ($result['success']) {
+        echo "✓ Created user '{$username}' with role '{$role}'\n";
+    } else {
+        echo "✗ {$result['error']}\n";
+        exit(1);
+    }
+}
+
+function cmdUserList() {
+    $auth = new Auth();
+    $users = $auth->listUsers();
+
+    if (empty($users)) {
+        echo "No users configured. Create one with:\n";
+        echo "  php cli.php user:add --username=admin --role=admin\n";
+        return;
+    }
+
+    echo "\nUser Accounts:\n";
+    echo str_repeat('=', 88) . "\n";
+    printf("%-20s %-12s %-9s %-17s %-15s\n", "Username", "Role", "Status", "Last Login", "Last IP");
+    echo str_repeat('-', 88) . "\n";
+
+    foreach ($users as $u) {
+        printf("%-20s %-12s %-9s %-17s %-15s\n",
+            substr($u['username'], 0, 19),
+            $u['role'],
+            $u['is_active'] ? 'active' : 'disabled',
+            $u['last_login_at'] ? date('Y-m-d H:i', strtotime($u['last_login_at'])) : 'never',
+            $u['last_login_ip'] ?: '—'
+        );
+    }
+    echo str_repeat('=', 88) . "\n";
+}
+
+function cmdUserPasswd($options) {
+    $auth = new Auth();
+
+    $username = $options['username'] ?? null;
+    if (!$username) {
+        echo "Error: --username is required\n";
+        exit(1);
+    }
+
+    $stmt = getDB()->prepare("SELECT id FROM users WHERE username = ?");
+    $stmt->execute([$username]);
+    $userId = $stmt->fetchColumn();
+
+    if (!$userId) {
+        echo "Error: user '{$username}' not found\n";
+        exit(1);
+    }
+
+    if (!empty($options['password'])) {
+        $password = $options['password'];
+        $confirm = $password;
+    } else {
+        echo "New password for '{$username}': ";
+        $password = readPassword();
+        echo "\nConfirm password: ";
+        $confirm = readPassword();
+        echo "\n";
+    }
+
+    if ($password !== $confirm) {
+        echo "Error: passwords do not match\n";
+        exit(1);
+    }
+
+    $result = $auth->changePassword($userId, $password, null);
+
+    if ($result['success']) {
+        echo "✓ Password updated for '{$username}'\n";
+    } else {
+        echo "✗ {$result['error']}\n";
+        exit(1);
+    }
+}
+
+function cmdAudit($options) {
+    $auth = new Auth();
+    $limit = isset($options['id']) ? (int) $options['id'] : 40;
+    $entries = $auth->listAuditLog($limit, 0);
+
+    if (empty($entries)) {
+        echo "No audit entries.\n";
+        return;
+    }
+
+    echo "\nAudit Log (most recent {$limit}):\n";
+    echo str_repeat('=', 110) . "\n";
+    printf("%-20s %-16s %-22s %-18s %s\n", "Date/Time", "User", "Action", "IP", "Detail");
+    echo str_repeat('-', 110) . "\n";
+
+    foreach ($entries as $e) {
+        printf("%-20s %-16s %-22s %-18s %s\n",
+            date('Y-m-d H:i:s', strtotime($e['created_at'])),
+            substr($e['username'] ?? '—', 0, 15),
+            substr($e['action'], 0, 21),
+            substr($e['ip_address'] ?? '—', 0, 17),
+            substr(preg_replace('/\s+/', ' ', $e['detail'] ?? ''), 0, 44)
+        );
+    }
+    echo str_repeat('=', 110) . "\n";
+}
+
+/**
+ * Read a password from the terminal without echoing it.
+ */
+function readPassword() {
+    if (!function_exists('shell_exec') || stripos(PHP_OS, 'WIN') === 0) {
+        // Fall back to a visible read on platforms without stty.
+        return trim(fgets(STDIN));
+    }
+    shell_exec('stty -echo');
+    $password = trim(fgets(STDIN));
+    shell_exec('stty echo');
+    return $password;
+}
+
 function showHelp() {
     echo "\n";
     echo "SPF Flattener CLI\n";
@@ -404,22 +597,36 @@ function showHelp() {
     echo "Usage:\n";
     echo "  php cli.php <command> [options]\n\n";
     echo "Commands:\n";
-    echo "  flatten    Flatten SPF record for a domain\n";
-    echo "  check      Check for SPF changes\n";
-    echo "  list       List all configured domains\n";
-    echo "  import     Import SPF record from DNS\n";
-    echo "  dns-test   Test DNS lookup (debug)\n";
-    echo "  config     View or set configuration\n";
-    echo "  help       Show this help message\n\n";
+    echo "  flatten      Flatten SPF record for a domain\n";
+    echo "  check        Check for SPF changes\n";
+    echo "  list         List all configured domains\n";
+    echo "  import       Import SPF record from DNS\n";
+    echo "  dns-test     Test DNS lookup (debug)\n";
+    echo "  config       View or set application configuration\n";
+    echo "  user:add     Create a user account\n";
+    echo "  user:list    List user accounts\n";
+    echo "  user:passwd  Change a user's password\n";
+    echo "  audit        Show recent audit log entries\n";
+    echo "  help         Show this help message\n\n";
     echo "Options:\n";
     echo "  --domain=DOMAIN    Target domain (required for flatten/check/import)\n";
     echo "  --add              Add domain if not found (for import command)\n";
     echo "  --force            Force update even if no changes\n";
     echo "  --no-email         Don't send notification emails\n";
-    echo "  --set KEY=VALUE    Set configuration value\n\n";
+    echo "  --set KEY=VALUE    Set configuration value\n";
+    echo "  --username=NAME    Username (user:add, user:passwd)\n";
+    echo "  --password=PASS    Password (omit to be prompted securely)\n";
+    echo "  --role=ROLE        admin | operator | viewer  (user:add)\n";
+    echo "  --email=ADDR       Email address (user:add)\n";
+    echo "  --name=NAME        Display name (user:add)\n";
+    echo "  --id=N             Number of audit rows to show\n\n";
     echo "Examples:\n";
+    echo "  php cli.php user:add --username=admin --role=admin\n";
+    echo "  php cli.php user:list\n";
+    echo "  php cli.php user:passwd --username=admin\n";
+    echo "  php cli.php audit --id=50\n";
     echo "  php cli.php list\n";
-    echo "  php cli.py flatten --domain=example.com\n";
+    echo "  php cli.php flatten --domain=example.com\n";
     echo "  php cli.php check --domain=example.com\n";
     echo "  php cli.php import --domain=example.com\n";
     echo "  php cli.php import --domain=newdomain.com --add\n";

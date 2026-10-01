@@ -15,6 +15,8 @@ chdir(__DIR__ . '/..');
 
 require_once __DIR__ . '/../config/config.php';
 require_once __DIR__ . '/../includes/Database.php';
+require_once __DIR__ . '/../includes/Security.php';
+require_once __DIR__ . '/../includes/Auth.php';
 require_once __DIR__ . '/../includes/SPFFlattener.php';
 require_once __DIR__ . '/../includes/CloudflareAPI.php';
 require_once __DIR__ . '/../includes/EmailNotifier.php';
@@ -27,6 +29,30 @@ $forceUpdate = isset($options['force']);
 $db = getDB();
 $flattener = new SPFFlattener();
 $notifier = new EmailNotifier();
+$auth = new Auth();
+
+// Attribute scheduled runs to a synthetic account in the audit trail.
+$SYSTEM_USER = 'system@cron';
+
+/**
+ * Write a scheduled action to the audit log.
+ */
+function cronAudit($db, $username, $action, $detail = null, $target = null) {
+    try {
+        $stmt = $db->prepare("
+            INSERT INTO audit_log (user_id, username, action, detail, target, ip_address, user_agent)
+            VALUES (NULL, ?, ?, ?, ?, '127.0.0.1', 'cron/auto-update.php')
+        ");
+        $stmt->execute([
+            $username,
+            substr((string) $action, 0, 64),
+            $detail,
+            $target ? substr((string) $target, 0, 255) : null,
+        ]);
+    } catch (Exception $e) {
+        error_log('Cron audit write failed: ' . $e->getMessage());
+    }
+}
 
 echo "=== SPF Flattener Auto-Update ===\n";
 echo "Started at: " . date('Y-m-d H:i:s') . "\n\n";
@@ -96,7 +122,11 @@ foreach ($domains as $domain) {
                             count($changes['ips_added']),
                             count($changes['ips_removed'])
                         ]);
-                        
+
+                        cronAudit($db, $SYSTEM_USER, 'SPF_FLATTENED',
+                            "Auto-updated {$domain['domain']} — {$changes['ips_added']} IP(s) added, {$changes['ips_removed']} removed",
+                            $domain['domain']);
+
                         // Send notification email
                         if (!$noEmail && ENABLE_EMAIL_NOTIFICATIONS) {
                             $notifier->sendUpdateNotification(
@@ -129,7 +159,11 @@ foreach ($domains as $domain) {
                         count($changes['ips_removed']),
                         !$noEmail ? 1 : 0
                     ]);
-                    
+
+                    cronAudit($db, $SYSTEM_USER, 'CHANGE_DETECTED',
+                        "{$domain['domain']} changed — {$changes['ips_added']} IP(s) added, {$changes['ips_removed']} removed; manual publish required",
+                        $domain['domain']);
+
                     // Send notification
                     if (!$noEmail && ENABLE_EMAIL_NOTIFICATIONS) {
                         $notifier->sendChangeNotification(

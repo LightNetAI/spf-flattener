@@ -1,18 +1,38 @@
 <?php
 /**
- * AJAX Handler for SPF Import
- * Handles DNS lookup and import of existing SPF records
+ * AJAX Handler for SPF Import — authentication required
  */
 
 require_once __DIR__ . '/config/config.php';
 require_once __DIR__ . '/includes/Database.php';
+require_once __DIR__ . '/includes/Security.php';
+require_once __DIR__ . '/includes/Auth.php';
 require_once __DIR__ . '/includes/DNSLookup.php';
 
 header('Content-Type: application/json');
 
-// Only allow POST
+Auth::startSession();
+$auth = new Auth();
+$auth->requireLoginJson();
+
+// CSRF is required for every state-changing call.
+if (!verifyCSRFToken($_POST['csrf_token'] ?? '')) {
+    http_response_code(403);
+    echo json_encode(['success' => false, 'error' => 'Invalid or missing CSRF token']);
+    exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
     echo json_encode(['success' => false, 'error' => 'Method not allowed']);
+    exit;
+}
+
+$user = $auth->user();
+if (!in_array($user['role'], ['admin', 'operator'], true)) {
+    $auth->auditCurrent('ACCESS_DENIED', 'AJAX import as ' . $user['role']);
+    http_response_code(403);
+    echo json_encode(['success' => false, 'error' => 'Your role does not permit imports']);
     exit;
 }
 
@@ -20,147 +40,99 @@ $action = $_POST['action'] ?? '';
 $db = getDB();
 
 try {
-    if ($action === 'test_dns') {
-        // Test DNS lookup functionality
-        $dns = new DNSLookup();
-        $testDomain = $_POST['domain'] ?? 'google.com';
-        $result = $dns->testDNS($testDomain);
-        echo json_encode($result);
-        
-    } elseif ($action === 'fetch_spf') {
-        // Fetch SPF record for a domain
-        $domain = trim($_POST['domain'] ?? '');
-        
-        if (empty($domain)) {
-            echo json_encode(['success' => false, 'error' => 'Domain is required']);
+    if ($action === 'fetch_spf') {
+        $domain = strtolower(trim($_POST['domain'] ?? ''));
+
+        if (!isValidDomain($domain)) {
+            echo json_encode(['success' => false, 'error' => 'That is not a valid domain name.']);
             exit;
         }
-        
+
         $dns = new DNSLookup();
-        $spfRecord = $dns->getSPFRecord($domain);
+        $spfRecord  = $dns->getSPFRecord($domain);
         $mechanisms = $dns->parseSPFRecord($spfRecord);
         $lookupCount = $dns->countLookups($spfRecord);
-        
+
         if (empty($spfRecord)) {
             echo json_encode([
                 'success' => false,
-                'error' => "No SPF record found for {$domain}",
-                'txt_records' => $dns->getTXTRecords($domain)
+                'error' => "No SPF record found for {$domain}.",
             ]);
             exit;
         }
-        
+
+        $auth->auditCurrent('SPF_FETCHED', "Fetched SPF for {$domain}", $domain);
+
         echo json_encode([
-            'success' => true,
-            'domain' => $domain,
-            'spf_record' => $spfRecord,
+            'success'      => true,
+            'domain'       => $domain,
+            'spf_record'   => $spfRecord,
             'lookup_count' => $lookupCount,
-            'mechanisms' => $mechanisms,
-            'includes' => $mechanisms['includes'],
-            'ip4' => $mechanisms['ip4'],
-            'ip6' => $mechanisms['ip6'],
-            'has_a' => !empty($mechanisms['a_records']),
-            'has_mx' => !empty($mechanisms['mx_records']),
-            'redirect' => $mechanisms['redirect']
+            'mechanisms'   => $mechanisms,
+            'includes'     => $mechanisms['includes'],
+            'ip4'          => $mechanisms['ip4'],
+            'ip6'          => $mechanisms['ip6'],
+            'has_a'        => !empty($mechanisms['a_records']),
+            'has_mx'       => !empty($mechanisms['mx_records']),
+            'redirect'     => $mechanisms['redirect'],
         ]);
-        
-    } elseif ($action === 'import') {
-        // Import SPF record for an existing domain
-        $domainId = $_POST['domain_id'] ?? 0;
-        
-        if (!$domainId) {
-            echo json_encode(['success' => false, 'error' => 'Domain ID is required']);
+        exit;
+    }
+
+    if ($action === 'add_and_import') {
+        $domain = strtolower(trim($_POST['domain'] ?? ''));
+        $zoneId = sanitizeString($_POST['cloudflare_zone_id'] ?? '', 100);
+
+        if (!isValidDomain($domain)) {
+            echo json_encode(['success' => false, 'error' => 'That is not a valid domain name.']);
             exit;
         }
-        
-        $dns = new DNSLookup();
-        $result = $dns->importSPFForDomain($domainId);
-        
-        // Add human-readable message about what was imported
-        if ($result['success']) {
-            $message = "Imported {$result['senders_added']} sender(s): ";
-            $parts = [];
-            
-            if (!empty($result['mechanisms']['includes'])) {
-                $parts[] = count($result['mechanisms']['includes']) . " include(s)";
-            }
-            if (!empty($result['direct_ips']['ip4'])) {
-                $parts[] = count($result['direct_ips']['ip4']) . " IPv4 address(es)";
-            }
-            if (!empty($result['direct_ips']['ip6'])) {
-                $parts[] = count($result['direct_ips']['ip6']) . " IPv6 address(es)";
-            }
-            if ($result['has_a_records']) {
-                $parts[] = "A record(s) - needs manual review";
-            }
-            if ($result['has_mx_records']) {
-                $parts[] = "MX record(s) - needs manual review";
-            }
-            
-            $result['import_summary'] = $message . implode(', ', $parts);
-        }
-        
-        echo json_encode($result);
-        
-    } elseif ($action === 'add_and_import') {
-        // Add new domain and immediately import its SPF
-        $domain = trim($_POST['domain'] ?? '');
-        $cloudflareZoneId = trim($_POST['cloudflare_zone_id'] ?? '');
-        
-        if (empty($domain)) {
-            echo json_encode(['success' => false, 'error' => 'Domain is required']);
-            exit;
-        }
-        
-        // Add domain first
+
         $stmt = $db->prepare("
             INSERT INTO domains (domain, cloudflare_zone_id, is_active)
             VALUES (?, ?, 1)
             ON DUPLICATE KEY UPDATE cloudflare_zone_id = VALUES(cloudflare_zone_id)
         ");
-        $stmt->execute([$domain, $cloudflareZoneId]);
-        $domainId = $db->lastInsertId();
-        
-        // Now import SPF
-        $dns = new DNSLookup();
-        $importResult = $dns->importSPFForDomain($domainId);
-        
-        // Add summary message
-        if ($importResult['success']) {
-            $message = "Imported {$importResult['senders_added']} sender(s): ";
-            $parts = [];
-            
-            if (!empty($importResult['mechanisms']['includes'])) {
-                $parts[] = count($importResult['mechanisms']['includes']) . " include(s)";
-            }
-            if (!empty($importResult['direct_ips']['ip4'])) {
-                $parts[] = count($importResult['direct_ips']['ip4']) . " IPv4 address(es)";
-            }
-            if (!empty($importResult['direct_ips']['ip6'])) {
-                $parts[] = count($importResult['direct_ips']['ip6']) . " IPv6 address(es)";
-            }
-            if ($importResult['has_a_records']) {
-                $parts[] = "A record(s)";
-            }
-            if ($importResult['has_mx_records']) {
-                $parts[] = "MX record(s)";
-            }
-            
-            $importResult['import_summary'] = $message . implode(', ', $parts);
+        $stmt->execute([$domain, $zoneId]);
+        $domainId = (int) $db->lastInsertId();
+        if (!$domainId) {
+            $s = $db->prepare("SELECT id FROM domains WHERE domain = ?");
+            $s->execute([$domain]);
+            $domainId = (int) $s->fetchColumn();
         }
-        
-        echo json_encode(array_merge([
-            'domain_id' => $domainId,
-            'domain' => $domain
-        ], $importResult));
-        
-    } else {
-        echo json_encode(['success' => false, 'error' => 'Unknown action']);
+
+        $dns = new DNSLookup();
+        $res = $dns->importSPFForDomain($domainId);
+
+        if ($res['success']) {
+            $parts = [];
+            if (!empty($res['mechanisms']['includes'])) {
+                $parts[] = count($res['mechanisms']['includes']) . ' include(s)';
+            }
+            if (!empty($res['direct_ips']['ip4'])) {
+                $parts[] = count($res['direct_ips']['ip4']) . ' IPv4';
+            }
+            if (!empty($res['direct_ips']['ip6'])) {
+                $parts[] = count($res['direct_ips']['ip6']) . ' IPv6';
+            }
+            if (!empty($res['has_a_records'])) {
+                $parts[] = 'A record(s)';
+            }
+            if (!empty($res['has_mx_records'])) {
+                $parts[] = 'MX record(s)';
+            }
+            $res['import_summary'] = 'Imported ' . $res['senders_added'] . ' sender(s): ' . implode(', ', $parts) . '.';
+            $auth->auditCurrent('SPF_IMPORTED', $res['import_summary'], $domain);
+        }
+
+        echo json_encode(array_merge(['domain_id' => $domainId, 'domain' => $domain], $res));
+        exit;
     }
-    
+
+    echo json_encode(['success' => false, 'error' => 'Unknown action']);
+
 } catch (Exception $e) {
-    echo json_encode([
-        'success' => false,
-        'error' => $e->getMessage()
-    ]);
+    error_log('import_spf.php error: ' . $e->getMessage());
+    http_response_code(500);
+    echo json_encode(['success' => false, 'error' => 'An internal error occurred.']);
 }

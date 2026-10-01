@@ -10,7 +10,18 @@ class Database {
     
     private function __construct() {
         try {
-            $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=" . DB_CHARSET;
+            // Allow a socket or non-default port for local/test deployments.
+            // When a unix socket is configured, omit the host entirely —
+            // supplying an IP alongside a socket makes mysqlnd use TCP.
+            if (defined('DB_SOCKET') && DB_SOCKET !== '') {
+                $dsn = "mysql:unix_socket=" . DB_SOCKET . ";dbname=" . DB_NAME . ";charset=" . DB_CHARSET;
+            } else {
+                $host = DB_HOST;
+                if (defined('DB_PORT') && DB_PORT) {
+                    $host .= ';port=' . DB_PORT;
+                }
+                $dsn = "mysql:host=" . $host . ";dbname=" . DB_NAME . ";charset=" . DB_CHARSET;
+            }
             $options = [
                 PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,

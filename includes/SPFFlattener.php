@@ -1,472 +1,653 @@
 <?php
 /**
  * SPF Flattener Core Class
- * 
- * Replicates the functionality of cfspflat/sender-policy-flattener
- * Handles SPF record parsing, DNS resolution, and IP flattening
+ *
+ * Replicates the functionality of cfspflat / sender-policy-flattener:
+ * resolves include: chains down to concrete ip4:/ip6: entries, counts
+ * DNS lookups per RFC 7208, and stores both the flattened record and the
+ * individual addresses it was built from.
  */
+
+require_once __DIR__ . '/Security.php';
 
 class SPFFlattener {
     private $db;
-    private $dnsCache = [];
     private $lookupCount = 0;
     private $maxLookups = MAX_DNS_LOOKUPS;
-    
+
     public function __construct() {
         $this->db = getDB();
     }
-    
+
+    /* ========================================================
+     * Public API
+     * ====================================================== */
+
     /**
-     * Flatten SPF record for a domain
-     * 
-     * @param int $domainId Domain ID from database
-     * @return array Result with flattened record and statistics
+     * Flatten the SPF record for a domain.
+     *
+     * @param int $domainId
+     * @return array Result with the flattened record and statistics
      */
     public function flattenDomain($domainId) {
         $result = [
-            'success' => false,
-            'domain_id' => $domainId,
-            'original_record' => '',
-            'flattened_record' => '',
+            'success'             => false,
+            'domain_id'           => $domainId,
+            'original_record'     => '',
+            'flattened_record'    => '',
             'lookup_count_before' => 0,
-            'lookup_count_after' => 0,
-            'ips_collected' => [],
-            'errors' => [],
-            'warnings' => []
+            'lookup_count_after'  => 0,
+            'ips_collected'       => [],
+            'errors'              => [],
+            'warnings'            => [],
         ];
-        
+
         try {
-            // Get domain info
             $stmt = $this->db->prepare("SELECT * FROM domains WHERE id = ?");
             $stmt->execute([$domainId]);
             $domain = $stmt->fetch();
-            
+
             if (!$domain) {
-                $result['errors'][] = "Domain not found";
+                $result['errors'][] = 'Domain not found.';
                 return $result;
             }
-            
-            // Get sending domains and approved senders
+
+            // Sending domains configured for this zone.
             $stmt = $this->db->prepare("
-                SELECT sd.*, d.domain as parent_domain 
-                FROM sending_domains sd 
-                JOIN domains d ON sd.domain_id = d.id 
-                WHERE sd.domain_id = ? AND sd.is_active = 1
+                SELECT * FROM sending_domains
+                 WHERE domain_id = ? AND is_active = 1
             ");
             $stmt->execute([$domainId]);
             $sendingDomains = $stmt->fetchAll();
-            
+
             if (empty($sendingDomains)) {
-                $result['errors'][] = "No active sending domains configured";
+                $result['errors'][] = 'No active sending domains configured.';
                 return $result;
             }
-            
-            $allIps = [];
+
+            $allIps             = [];
             $totalLookupsBefore = 0;
-            
+            $senderCount        = 0;
+
             foreach ($sendingDomains as $sendingDomain) {
-                // Get approved senders for this sending domain
+                // Count the lookups in the live record for this sending domain.
+                $originalRecord = $this->getSPFRecordFromDns($sendingDomain['sending_domain']);
+                $totalLookupsBefore += $this->countLookups($originalRecord);
+
                 $stmt = $this->db->prepare("
-                    SELECT * FROM approved_senders 
-                    WHERE sending_domain_id = ? AND is_active = 1
+                    SELECT * FROM approved_senders
+                     WHERE sending_domain_id = ? AND is_active = 1
                 ");
                 $stmt->execute([$sendingDomain['id']]);
                 $senders = $stmt->fetchAll();
-                
-                // Get original SPF record
-                $originalRecord = $this->getOriginalSPF($sendingDomain['sending_domain']);
-                $totalLookupsBefore += $this->countLookups($originalRecord);
-                
-                // Collect IPs from each sender
+
                 foreach ($senders as $sender) {
-                    $ips = $this->resolveInclude($sender['include_domain']);
-                    foreach ($ips as $ip) {
+                    $senderCount++;
+                    $ips = $this->resolveMechanism($sender['include_domain']);
+
+                    if (empty($ips)) {
+                        $result['warnings'][] = "No addresses resolved for '{$sender['include_domain']}'.";
+                    }
+
+                    foreach ($ips as $ipData) {
+                        // $ipData is ['ip' => string, 'version' => '4'|'6']
                         $allIps[] = [
-                            'ip' => $ip,
-                            'source' => $sender['sender_name'],
-                            'include' => $sender['include_domain']
+                            'ip'      => $ipData['ip'],
+                            'version' => $ipData['version'],
+                            'source'  => $sender['sender_name'],
+                            'include' => $sender['include_domain'],
                         ];
                     }
                 }
             }
-            
-            // Deduplicate IPs
+
+            if ($senderCount === 0) {
+                $result['errors'][] = 'No approved senders configured for this domain.';
+                return $result;
+            }
+
             $uniqueIps = $this->deduplicateIps($allIps);
             $result['ips_collected'] = $uniqueIps;
-            
-            // Build flattened SPF record
-            $flattenedParts = ['v=spf1'];
-            $currentLength = 7; // length of 'v=spf1 '
-            
-            // Sort IPs: IPv4 first, then IPv6
-            $ipv4s = array_filter($uniqueIps, fn($ip) => $ip['version'] === '4');
-            $ipv6s = array_filter($uniqueIps, fn($ip) => $ip['version'] === '6');
-            
-            foreach ($ipv4s as $ipData) {
-                $part = 'ip4:' . $ipData['ip'];
-                if ($currentLength + strlen($part) + 1 <= MAX_SPF_LENGTH) {
-                    $flattenedParts[] = $part;
-                    $currentLength += strlen($part) + 1;
-                } else {
-                    $result['warnings'][] = "IPv4 address {$ipData['ip']} exceeded record length limit";
-                }
+
+            if (empty($uniqueIps)) {
+                $result['errors'][] = 'No IP addresses could be resolved from the configured senders.';
+                return $result;
             }
-            
-            foreach ($ipv6s as $ipData) {
-                $part = 'ip6:' . $ipData['ip'];
-                if ($currentLength + strlen($part) + 1 <= MAX_SPF_LENGTH) {
-                    $flattenedParts[] = $part;
-                    $currentLength += strlen($part) + 1;
-                } else {
-                    $result['warnings'][] = "IPv6 address {$ipData['ip']} exceeded record length limit";
-                }
-            }
-            
-            // Add ~all or -all at the end
-            $flattenedParts[] = '~all';
-            
-            $flattenedRecord = implode(' ', $flattenedParts);
-            
-            // If record is still too long, we need to split into multiple records
-            if (strlen($flattenedRecord) > MAX_SPF_LENGTH) {
-                $result['warnings'][] = "Record exceeds 255 characters - may need DNS chaining";
-            }
-            
-            $result['success'] = true;
-            $result['original_record'] = $domain['original_spf_record'] ?? '';
-            $result['flattened_record'] = $flattenedRecord;
+
+            // ---- Build the record -------------------------------------
+            // RFC 7208 limits a single TXT record to 255 characters, which
+            // is far too small to hold every address. Like cfspflat, we
+            // emit the root record plus a chain of sub-records so the
+            // entire set can be published.
+            $recordSet = $this->buildRecordSet($uniqueIps, $domain['domain'], $result['warnings']);
+
+            $result['success']             = true;
+            $result['original_record']     = $domain['original_spf_record'] ?? '';
+            $result['flattened_record']    = $recordSet['root'];
+            $result['record_set']          = $recordSet;
             $result['lookup_count_before'] = $totalLookupsBefore;
-            $result['lookup_count_after'] = 0; // Flattened has zero lookups
-            
-            // Store results
-            $this->saveFlatteningResult($domainId, $flattenedRecord, count($uniqueIps));
+            $result['lookup_count_after']  = $recordSet['lookups'];
+
+            $this->saveFlatteningResult($domainId, $recordSet['root'], count($uniqueIps));
             $this->storeFlattenedIps($domainId, $uniqueIps);
-            
-        } catch (Exception $e) {
+
+        } catch (Throwable $e) {
             $result['errors'][] = $e->getMessage();
-            error_log("SPF flattening error: " . $e->getMessage());
+            error_log('SPF flattening error: ' . $e->getMessage());
         }
-        
+
         return $result;
     }
-    
+
     /**
-     * Get original SPF record from DNS
+     * Detect whether the resolved IP set differs from what is stored.
+     * Does not mutate the stored record.
      */
-    private function getOriginalSPF($domain) {
-        $cached = $this->getFromCache($domain, 'TXT');
-        if ($cached !== null) {
-            return $cached;
+    public function detectChanges($domainId) {
+        $changes = ['ips_added' => [], 'ips_removed' => [], 'has_changes' => false];
+
+        // Currently stored addresses (ip => version).
+        $stmt = $this->db->prepare("
+            SELECT ip_address FROM flattened_ips
+             WHERE domain_id = ? AND is_active = 1
+        ");
+        $stmt->execute([$domainId]);
+        $stored = array_flip($stmt->fetchAll(PDO::FETCH_COLUMN));
+
+        // Resolve fresh, without writing anything.
+        $fresh = [];
+        foreach ($this->resolveDomainSenders($domainId) as $ipData) {
+            $fresh[$ipData['ip']] = true;
         }
-        
-        // Use dig or nslookup for DNS query
-        $output = shell_exec("dig +short TXT {$domain} 2>/dev/null");
-        if ($output) {
-            $records = $this->parseTXTRecords($output);
-            $spfRecord = $this->findSPFRecord($records);
-            $this->saveToCache($domain, 'TXT', $spfRecord);
-            return $spfRecord;
-        }
-        
-        return '';
-    }
-    
-    /**
-     * Parse TXT records from dig output
-     */
-    private function parseTXTRecords($output) {
-        $records = [];
-        preg_match_all('/"([^"]*)"/', $output, $matches);
-        if (!empty($matches[1])) {
-            $records = $matches[1];
-        }
-        return $records;
-    }
-    
-    /**
-     * Find SPF record in TXT records
-     */
-    private function findSPFRecord($records) {
-        foreach ($records as $record) {
-            if (strpos($record, 'v=spf1') === 0) {
-                return $record;
+
+        foreach (array_keys($fresh) as $ip) {
+            if (!isset($stored[$ip])) {
+                $changes['ips_added'][] = $ip;
+                $changes['has_changes'] = true;
             }
         }
-        return '';
-    }
-    
-    /**
-     * Count DNS lookups in an SPF record
-     */
-    private function countLookups($spfRecord) {
-        if (empty($spfRecord)) return 0;
-        
-        $count = 0;
-        $parts = explode(' ', $spfRecord);
-        
-        foreach ($parts as $part) {
-            // These mechanisms cause DNS lookups
-            if (preg_match('/^include:/i', $part)) {
-                $count++;
-            } elseif (preg_match('/^a$/i', $part) || preg_match('/^a:/i', $part)) {
-                $count++;
-            } elseif (preg_match('/^mx$/i', $part) || preg_match('/^mx:/i', $part)) {
-                $count++;
-            } elseif (preg_match('/^ptr$/i', $part) || preg_match('/^ptr:/i', $part)) {
-                $count++;
-            } elseif (preg_match('/^exists:/i', $part)) {
-                $count++;
-            } elseif (preg_match('/^redirect=/i', $part)) {
-                $count++;
+        foreach (array_keys($stored) as $ip) {
+            if (!isset($fresh[$ip])) {
+                $changes['ips_removed'][] = $ip;
+                $changes['has_changes'] = true;
             }
         }
-        
-        return $count;
+
+        return $changes;
     }
-    
+
+    /* ========================================================
+     * Resolution
+     * ====================================================== */
+
     /**
-     * Resolve an include domain to IP addresses
+     * Resolve every approved sender of a domain to IP records
+     * without persisting anything.
+     *
+     * @return array List of ['ip' => string, 'version' => '4'|'6']
+     */
+    private function resolveDomainSenders($domainId) {
+        $stmt = $this->db->prepare("
+            SELECT asp.include_domain
+              FROM approved_senders asp
+              JOIN sending_domains sd ON asp.sending_domain_id = sd.id
+             WHERE sd.domain_id = ? AND sd.is_active = 1 AND asp.is_active = 1
+        ");
+        $stmt->execute([$domainId]);
+
+        $ips = [];
+        foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $includeDomain) {
+            foreach ($this->resolveMechanism($includeDomain) as $ipData) {
+                $ips[] = $ipData;
+            }
+        }
+        return $ips;
+    }
+
+    /**
+     * Resolve a single configured mechanism to IP records.
+     * Accepts a bare domain (include:), an "ip4:"/"ip6:" literal, or a
+     * "a:"/"mx:" qualifier.
+     *
+     * @param string $mechanism
+     * @param int    $depth
+     * @return array List of ['ip' => string, 'version' => '4'|'6']
+     */
+    private function resolveMechanism($mechanism, $depth = 0) {
+        $mechanism = trim($mechanism);
+
+        if ($mechanism === '' || $depth > $this->maxLookups) {
+            if ($depth > $this->maxLookups) {
+                error_log("SPF recursion limit reached at {$mechanism}");
+            }
+            return [];
+        }
+
+        // Direct literal address or network — no lookup required.
+        if (preg_match('/^ip4:(.+)$/i', $mechanism, $m)) {
+            $net = trim($m[1]);
+            return $this->isValidIpv4Network($net) ? [['ip' => $net, 'version' => '4']] : [];
+        }
+        if (preg_match('/^ip6:(.+)$/i', $mechanism, $m)) {
+            $net = trim($m[1]);
+            return $this->isValidIpv6Network($net) ? [['ip' => $net, 'version' => '6']] : [];
+        }
+
+        // a: / mx: qualifiers.
+        if (preg_match('/^a:(.+)$/i', $mechanism, $m)) {
+            return $this->getAddressRecords(trim($m[1]));
+        }
+        if (preg_match('/^mx:(.+)$/i', $mechanism, $m)) {
+            return $this->resolveMxHosts(trim($m[1]));
+        }
+
+        // Otherwise treat it as an SPF include domain.
+        return $this->resolveInclude($mechanism, $depth);
+    }
+
+    /**
+     * Resolve an include: domain's SPF record recursively.
      */
     private function resolveInclude($includeDomain, $depth = 0) {
         if ($depth > $this->maxLookups) {
             error_log("Max lookup depth reached for {$includeDomain}");
             return [];
         }
-        
+
         $this->lookupCount++;
         $ips = [];
-        
-        // Get SPF record for the include domain
-        $spfRecord = $this->getOriginalSPF($includeDomain);
-        
+
+        $spfRecord = $this->getSPFRecordFromDns($includeDomain);
+
+        // No SPF record published: fall back to the host's A/AAAA records.
         if (empty($spfRecord)) {
-            // Try to get A/AAAA records directly
-            $aRecords = $this->getARecords($includeDomain);
-            $aaaaRecords = $this->getAAAARecords($includeDomain);
-            $ips = array_merge($aRecords, $aaaaRecords);
-            return $ips;
+            return $this->getAddressRecords($includeDomain);
         }
-        
-        // Parse the SPF record
-        $parts = explode(' ', $spfRecord);
-        
-        foreach ($parts as $part) {
-            if (preg_match('/^ip4:([\d\.\/]+)/i', $part, $matches)) {
-                $ips[] = ['ip' => $matches[1], 'version' => '4'];
-            } elseif (preg_match('/^ip6:([a-f0-9:\/]+)/i', $part, $matches)) {
-                $ips[] = ['ip' => $matches[1], 'version' => '6'];
-            } elseif (preg_match('/^include:([^ ]+)/i', $part, $matches)) {
-                // Recursively resolve nested includes
-                $nestedIps = $this->resolveInclude($matches[1], $depth + 1);
-                $ips = array_merge($ips, $nestedIps);
-            } elseif (preg_match('/^a:([^ ]+)?/i', $part, $matches)) {
-                $aDomain = $matches[1] ?? $includeDomain;
-                $aRecords = $this->getARecords($aDomain);
-                $ips = array_merge($ips, $aRecords);
-            } elseif (preg_match('/^mx:([^ ]+)?/i', $part, $matches)) {
-                $mxDomain = $matches[1] ?? $includeDomain;
-                $mxRecords = $this->getMXRecords($mxDomain);
-                foreach ($mxRecords as $mx) {
-                    $aRecords = $this->getARecords($mx);
-                    $ips = array_merge($ips, $aRecords);
+
+        foreach (preg_split('/\s+/', trim($spfRecord)) as $part) {
+            if (preg_match('/^ip4:(.+)$/i', $part, $m)) {
+                if ($this->isValidIpv4Network($m[1])) {
+                    $ips[] = ['ip' => $m[1], 'version' => '4'];
+                }
+            } elseif (preg_match('/^ip6:(.+)$/i', $part, $m)) {
+                if ($this->isValidIpv6Network($m[1])) {
+                    $ips[] = ['ip' => $m[1], 'version' => '6'];
+                }
+            } elseif (preg_match('/^include:(.+)$/i', $part, $m)) {
+                // Recursively resolve nested includes.
+                foreach ($this->resolveInclude(trim($m[1]), $depth + 1) as $nested) {
+                    $ips[] = $nested;
+                }
+            } elseif (preg_match('/^redirect=(.+)$/i', $part, $m)) {
+                foreach ($this->resolveInclude(trim($m[1]), $depth + 1) as $nested) {
+                    $ips[] = $nested;
+                }
+            } elseif (preg_match('/^a(?::(.+))?$/i', $part, $m)) {
+                $target = !empty($m[1]) ? $m[1] : $includeDomain;
+                foreach ($this->getAddressRecords($target) as $r) {
+                    $ips[] = $r;
+                }
+            } elseif (preg_match('/^mx(?::(.+))?$/i', $part, $m)) {
+                $target = !empty($m[1]) ? $m[1] : $includeDomain;
+                foreach ($this->resolveMxHosts($target) as $r) {
+                    $ips[] = $r;
+                }
+            }
+            // ptr: and exists: are deprecated / cannot be flattened safely
+            // to a static list, so they are intentionally ignored.
+        }
+
+        return $ips;
+    }
+
+    /**
+     * Resolve a domain to its A and AAAA records.
+     */
+    private function getAddressRecords($domain) {
+        return array_merge($this->getARecords($domain), $this->getAAAARecords($domain));
+    }
+
+    /**
+     * Resolve a domain's MX hosts to their addresses.
+     */
+    private function resolveMxHosts($domain) {
+        $ips = [];
+        foreach ($this->getMXRecords($domain) as $host) {
+            foreach ($this->getAddressRecords($host) as $r) {
+                $ips[] = $r;
+            }
+        }
+        return $ips;
+    }
+
+    /* ========================================================
+     * DNS
+     * ====================================================== */
+
+    /**
+     * Fetch and cache the SPF record for a domain (cache type 'SPF').
+     */
+    private function getSPFRecordFromDns($domain) {
+        $sanitized = sanitizeDomainForShell($domain);
+        if ($sanitized === false) {
+            error_log("Invalid domain in getSPFRecordFromDns: {$domain}");
+            return '';
+        }
+
+        $cached = $this->getFromCache($domain, 'SPF');
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        $output = shell_exec("dig +short TXT {$sanitized} 2>/dev/null");
+        $record = '';
+
+        if ($output) {
+            // A TXT record may be returned as several quoted chunks which
+            // must be concatenated to reconstruct the SPF string.
+            foreach (preg_split('/\r?\n/', trim($output)) as $line) {
+                $line = trim($line);
+                if ($line === '') {
+                    continue;
+                }
+                $candidate = '';
+                if (preg_match_all('/"([^"]*)"/', $line, $chunks) && !empty($chunks[1])) {
+                    $candidate = implode('', $chunks[1]);
+                } else {
+                    $candidate = trim($line, '"');
+                }
+                if (stripos($candidate, 'v=spf1') === 0) {
+                    $record = $candidate;
+                    break;
                 }
             }
         }
-        
-        return $ips;
+
+        $this->saveToCache($domain, 'SPF', $record);
+        return $record;
     }
-    
-    /**
-     * Get A records for a domain
-     */
+
     private function getARecords($domain) {
+        $sanitized = sanitizeDomainForShell($domain);
+        if ($sanitized === false) {
+            return [];
+        }
+
         $cached = $this->getFromCache($domain, 'A');
         if ($cached !== null) {
-            return json_decode($cached, true) ?? [];
+            $decoded = json_decode($cached, true);
+            if (is_array($decoded)) {
+                return $decoded;
+            }
         }
-        
+
         $ips = [];
-        $output = shell_exec("dig +short A {$domain} 2>/dev/null");
+        $output = shell_exec("dig +short A {$sanitized} 2>/dev/null");
         if ($output) {
-            foreach (explode("\n", trim($output)) as $line) {
-                if (filter_var(trim($line), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-                    $ips[] = ['ip' => trim($line), 'version' => '4'];
+            foreach (preg_split('/\r?\n/', trim($output)) as $line) {
+                $line = trim($line);
+                if ($line !== '' && filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                    // dig may return "1.2.3.4." for some zones.
+                    $ips[] = ['ip' => rtrim($line, '.'), 'version' => '4'];
                 }
             }
-            $this->saveToCache($domain, 'A', json_encode($ips));
         }
-        
+
+        $this->saveToCache($domain, 'A', json_encode($ips));
         return $ips;
     }
-    
-    /**
-     * Get AAAA records for a domain
-     */
+
     private function getAAAARecords($domain) {
+        $sanitized = sanitizeDomainForShell($domain);
+        if ($sanitized === false) {
+            return [];
+        }
+
         $cached = $this->getFromCache($domain, 'AAAA');
         if ($cached !== null) {
-            return json_decode($cached, true) ?? [];
+            $decoded = json_decode($cached, true);
+            if (is_array($decoded)) {
+                return $decoded;
+            }
         }
-        
+
         $ips = [];
-        $output = shell_exec("dig +short AAAA {$domain} 2>/dev/null");
+        $output = shell_exec("dig +short AAAA {$sanitized} 2>/dev/null");
         if ($output) {
-            foreach (explode("\n", trim($output)) as $line) {
-                if (filter_var(trim($line), FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
-                    $ips[] = ['ip' => trim($line), 'version' => '6'];
+            foreach (preg_split('/\r?\n/', trim($output)) as $line) {
+                $line = trim($line);
+                if ($line !== '' && filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+                    $ips[] = ['ip' => $line, 'version' => '6'];
                 }
             }
-            $this->saveToCache($domain, 'AAAA', json_encode($ips));
         }
-        
+
+        $this->saveToCache($domain, 'AAAA', json_encode($ips));
         return $ips;
     }
-    
-    /**
-     * Get MX records for a domain
-     */
+
     private function getMXRecords($domain) {
-        $mxHosts = [];
-        $output = shell_exec("dig +short MX {$domain} 2>/dev/null");
+        $sanitized = sanitizeDomainForShell($domain);
+        if ($sanitized === false) {
+            return [];
+        }
+
+        $hosts = [];
+        $output = shell_exec("dig +short MX {$sanitized} 2>/dev/null");
         if ($output) {
-            foreach (explode("\n", trim($output)) as $line) {
+            foreach (preg_split('/\r?\n/', trim($output)) as $line) {
                 $parts = preg_split('/\s+/', trim($line));
                 if (count($parts) >= 2) {
-                    $mxHosts[] = $parts[1];
+                    $hosts[] = rtrim($parts[1], '.');
                 }
             }
         }
-        return $mxHosts;
+        return $hosts;
     }
-    
+
+    /* ========================================================
+     * Helpers
+     * ====================================================== */
+
     /**
-     * Deduplicate IP addresses
+     * Count DNS-lookup mechanisms in an SPF record (RFC 7208 §4.6.4).
      */
+    public function countLookups($spfRecord) {
+        if (empty($spfRecord)) {
+            return 0;
+        }
+
+        $count = 0;
+        foreach (preg_split('/\s+/', $spfRecord) as $part) {
+            if (preg_match('/^(include:|a$|a:|mx$|mx:|ptr$|ptr:|exists:|redirect=)/i', $part)) {
+                $count++;
+            }
+        }
+        return $count;
+    }
+
+    private function isValidIpv4Network($value) {
+        $value = trim($value);
+        // Allow bare addresses and CIDR networks.
+        if (strpos($value, '/') !== false) {
+            [$addr, $bits] = array_pad(explode('/', $value, 2), 2, null);
+            return filter_var($addr, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false
+                && ctype_digit((string) $bits) && (int) $bits >= 0 && (int) $bits <= 32;
+        }
+        return filter_var($value, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+    }
+
+    private function isValidIpv6Network($value) {
+        $value = trim($value);
+        if (strpos($value, '/') !== false) {
+            [$addr, $bits] = array_pad(explode('/', $value, 2), 2, null);
+            return filter_var($addr, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false
+                && ctype_digit((string) $bits) && (int) $bits >= 0 && (int) $bits <= 128;
+        }
+        return filter_var($value, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false;
+    }
+
     private function deduplicateIps($ips) {
         $unique = [];
-        $seen = [];
-        
+        $seen   = [];
+
         foreach ($ips as $ipData) {
-            $key = $ipData['ip'];
+            if (empty($ipData['ip']) || !is_string($ipData['ip'])) {
+                continue;
+            }
+            $key = strtolower($ipData['ip']);
             if (!isset($seen[$key])) {
                 $seen[$key] = true;
                 $unique[] = $ipData;
             }
         }
-        
+
         return $unique;
     }
-    
+
     /**
-     * Save flattening result to database
+     * Build the root record plus any chained sub-records needed to hold
+     * every address inside the 255-character DNS limit.
+     *
+     * @return array{root:string,chained:array,lookups:int}
      */
+    private function buildRecordSet($ips, $domain, &$warnings) {
+        $prefix = 'v=spf1';
+        $suffix = '~all';
+
+        // IPv4 first, then IPv6 — mirrors cfspflat's ordering.
+        usort($ips, function ($a, $b) {
+            if ($a['version'] === $b['version']) {
+                return strcmp($a['ip'], $b['ip']);
+            }
+            return $a['version'] === '4' ? -1 : 1;
+        });
+
+        $mechanisms = [];
+        foreach ($ips as $ipData) {
+            $mechanisms[] = ($ipData['version'] === '4' ? 'ip4:' : 'ip6:') . $ipData['ip'];
+        }
+
+        // Pack mechanisms into chunks that fit the 255-char TXT limit.
+        $chunks = [];
+        $current = [];
+        $length = strlen($prefix);
+
+        foreach ($mechanisms as $mech) {
+            $extra = strlen($mech) + 1; // leading space
+            if ($length + $extra > MAX_SPF_LENGTH - strlen($suffix) - 1 && !empty($current)) {
+                $chunks[] = $current;
+                $current = [];
+                $length = strlen($prefix);
+            }
+            $current[] = $mech;
+            $length += $extra;
+        }
+        if (!empty($current)) {
+            $chunks[] = $current;
+        }
+
+        if (empty($chunks)) {
+            return ['root' => 'v=spf1 ~all', 'chained' => [], 'lookups' => 0];
+        }
+
+        // Single chunk: the flattened record is completely lookup-free.
+        if (count($chunks) === 1) {
+            $root = $prefix . ' ' . implode(' ', $chunks[0]) . ' ' . $suffix;
+            if (strlen($root) > MAX_SPF_LENGTH) {
+                $warnings[] = 'Record exceeds the 255-character DNS limit.';
+            }
+            return ['root' => $root, 'chained' => [], 'lookups' => 0];
+        }
+
+        // Multiple chunks: publish sub-records and chain them with
+        // include:, exactly as cfspflat does. The chains each cost one
+        // lookup, so the count is reported honestly.
+        $base = preg_replace('/^www\./', '', strtolower($domain));
+        $chained = [];
+        $chainNames = [];
+
+        foreach ($chunks as $i => $chunk) {
+            $name = "spf{$i}.{$base}";
+            $chained[] = [
+                'name'    => $name,
+                'content' => $prefix . ' ' . implode(' ', $chunk) . ' ' . $suffix,
+            ];
+            $chainNames[] = $name;
+        }
+
+        $root = $prefix;
+        foreach ($chainNames as $name) {
+            $candidate = $root . ' include:' . $name;
+            if (strlen($candidate) + strlen($suffix) + 1 > MAX_SPF_LENGTH) {
+                $warnings[] = 'Too many chained sub-records to fit in the root record; '
+                            . 'consider removing unused senders.';
+                break;
+            }
+            $root = $candidate;
+        }
+        $root .= ' ' . $suffix;
+
+        return ['root' => $root, 'chained' => $chained, 'lookups' => count($chainNames)];
+    }
+
+    /* ========================================================
+     * Persistence
+     * ====================================================== */
+
     private function saveFlatteningResult($domainId, $flattenedRecord, $ipCount) {
         $stmt = $this->db->prepare("
-            UPDATE domains 
-            SET flattened_spf_record = ?, 
-                lookup_count_after = 0,
-                last_flattened_at = NOW(),
-                last_updated_at = NOW()
-            WHERE id = ?
+            UPDATE domains
+               SET flattened_spf_record = ?,
+                   lookup_count_after   = ?,
+                   last_flattened_at    = NOW(),
+                   last_updated_at      = NOW()
+             WHERE id = ?
         ");
-        $stmt->execute([$flattenedRecord, $domainId]);
+        $stmt->execute([$flattenedRecord, 0, $domainId]);
     }
-    
-    /**
-     * Store flattened IPs in database
-     */
+
     private function storeFlattenedIps($domainId, $ips) {
-        // Deactivate existing IPs first
+        // Mark everything stale, then reactivate/insert the current set.
         $stmt = $this->db->prepare("UPDATE flattened_ips SET is_active = 0 WHERE domain_id = ?");
         $stmt->execute([$domainId]);
-        
-        // Insert/update new IPs
+
         $stmt = $this->db->prepare("
             INSERT INTO flattened_ips (domain_id, ip_address, ip_version, source_include, is_active)
             VALUES (?, ?, ?, ?, 1)
-            ON DUPLICATE KEY UPDATE is_active = 1, last_verified = NOW()
+            ON DUPLICATE KEY UPDATE is_active = 1, last_verified = NOW(), source_include = VALUES(source_include)
         ");
-        
+
         foreach ($ips as $ipData) {
             $stmt->execute([
                 $domainId,
                 $ipData['ip'],
                 $ipData['version'],
-                $ipData['source'] ?? $ipData['include'] ?? 'direct'
+                $ipData['source'] ?? $ipData['include'] ?? 'direct',
             ]);
         }
     }
-    
-    /**
-     * Get DNS cache entry
-     */
+
+    /* ========================================================
+     * Cache
+     * ====================================================== */
+
     private function getFromCache($domain, $type) {
         $stmt = $this->db->prepare("
-            SELECT result_data FROM dns_cache 
-            WHERE query_domain = ? AND query_type = ? AND expires_at > NOW()
+            SELECT result_data FROM dns_cache
+             WHERE query_domain = ? AND query_type = ? AND expires_at > NOW()
         ");
         $stmt->execute([$domain, $type]);
         $result = $stmt->fetchColumn();
-        return $result ?: null;
+        return ($result === false || $result === null) ? null : $result;
     }
-    
-    /**
-     * Save DNS cache entry
-     */
+
     private function saveToCache($domain, $type, $data) {
-        $expires = date('Y-m-d H:i:s', time() + DNS_CACHE_TTL);
         $stmt = $this->db->prepare("
             INSERT INTO dns_cache (query_domain, query_type, result_data, expires_at)
             VALUES (?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE result_data = VALUES(result_data), expires_at = VALUES(expires_at)
         ");
-        $stmt->execute([$domain, $type, $data, $expires]);
-    }
-    
-    /**
-     * Compare current flattened IPs with stored ones to detect changes
-     */
-    public function detectChanges($domainId) {
-        $changes = [
-            'ips_added' => [],
-            'ips_removed' => [],
-            'has_changes' => false
-        ];
-        
-        // Get currently stored active IPs
-        $stmt = $this->db->prepare("
-            SELECT ip_address, ip_version FROM flattened_ips 
-            WHERE domain_id = ? AND is_active = 1
-        ");
-        $stmt->execute([$domainId]);
-        $storedIps = $stmt->fetchAll(PDO::FETCH_COLUMN | PDO::FETCH_GROUP);
-        
-        // Flatten again to get current IPs
-        $result = $this->flattenDomain($domainId);
-        
-        if ($result['success']) {
-            $currentIps = [];
-            foreach ($result['ips_collected'] as $ipData) {
-                $currentIps[$ipData['ip']] = $ipData['version'];
-            }
-            
-            // Find added IPs
-            foreach ($currentIps as $ip => $version) {
-                if (!isset($storedIps[$ip])) {
-                    $changes['ips_added'][] = $ip;
-                    $changes['has_changes'] = true;
-                }
-            }
-            
-            // Find removed IPs
-            foreach ($storedIps as $ip => $version) {
-                if (!isset($currentIps[$ip])) {
-                    $changes['ips_removed'][] = $ip;
-                    $changes['has_changes'] = true;
-                }
-            }
-        }
-        
-        return $changes;
+        $stmt->execute([$domain, $type, $data, date('Y-m-d H:i:s', time() + DNS_CACHE_TTL)]);
     }
 }

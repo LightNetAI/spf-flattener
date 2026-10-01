@@ -1,10 +1,55 @@
 -- SPF Flattener Database Schema
+-- ATS Solutions branded build
 -- Run this to create the required tables
 
 CREATE DATABASE IF NOT EXISTS spf_flattener CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE spf_flattener;
 
--- Configuration table for global settings
+-- ============================================================
+-- Users (authentication)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(64) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    display_name VARCHAR(128) DEFAULT NULL,
+    email VARCHAR(255) DEFAULT NULL,
+    role ENUM('admin', 'operator', 'viewer') DEFAULT 'operator',
+    is_active TINYINT(1) DEFAULT 1,
+    must_change_password TINYINT(1) DEFAULT 0,
+    failed_attempts INT DEFAULT 0,
+    locked_until TIMESTAMP NULL,
+    last_login_at TIMESTAMP NULL,
+    last_login_ip VARCHAR(45) DEFAULT NULL,
+    password_changed_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_username (username),
+    INDEX idx_active (is_active)
+);
+
+-- ============================================================
+-- Audit log: date/time, ip, action, username
+-- ============================================================
+CREATE TABLE IF NOT EXISTS audit_log (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT DEFAULT NULL,
+    username VARCHAR(64) DEFAULT NULL,
+    action VARCHAR(64) NOT NULL,
+    detail TEXT,
+    target VARCHAR(255) DEFAULT NULL,
+    ip_address VARCHAR(45) DEFAULT NULL,
+    user_agent VARCHAR(255) DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_created (created_at),
+    INDEX idx_username (username),
+    INDEX idx_action (action),
+    INDEX idx_user (user_id)
+);
+
+-- ============================================================
+-- Application configuration
+-- ============================================================
 CREATE TABLE IF NOT EXISTS config (
     id INT AUTO_INCREMENT PRIMARY KEY,
     config_key VARCHAR(100) UNIQUE NOT NULL,
@@ -118,7 +163,7 @@ CREATE TABLE IF NOT EXISTS email_queue (
 CREATE TABLE IF NOT EXISTS dns_cache (
     id INT AUTO_INCREMENT PRIMARY KEY,
     query_domain VARCHAR(255) NOT NULL,
-    query_type ENUM('TXT', 'A', 'AAAA', 'MX') NOT NULL,
+    query_type ENUM('SPF', 'TXT', 'A', 'AAAA', 'MX') NOT NULL,
     result_data TEXT,
     expires_at TIMESTAMP NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
