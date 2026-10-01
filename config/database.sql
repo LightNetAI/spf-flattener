@@ -159,6 +159,29 @@ CREATE TABLE IF NOT EXISTS email_queue (
     INDEX idx_status (status)
 );
 
+-- ============================================================
+-- Generated SPF record chain
+--
+-- A flattened zone is published as several records: spf0.<domain>
+-- includes spf1.<domain>, and so on. The set must be stored in full
+-- because publishing only the first record leaves the chain broken.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS flattened_records (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    domain_id INT NOT NULL,
+    seq INT NOT NULL,                          -- 0 = spf0.<domain>
+    record_name VARCHAR(255) NOT NULL,
+    content TEXT NOT NULL,
+    char_length INT DEFAULT 0,
+    is_last TINYINT(1) DEFAULT 0,              -- final record, carries no include
+    is_active TINYINT(1) DEFAULT 1,            -- current set for this domain
+    published_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (domain_id) REFERENCES domains(id) ON DELETE CASCADE,
+    INDEX idx_domain_seq (domain_id, seq),
+    INDEX idx_domain_active (domain_id, is_active)
+);
+
 -- DNS lookup cache (to reduce repeated lookups)
 CREATE TABLE IF NOT EXISTS dns_cache (
     id INT AUTO_INCREMENT PRIMARY KEY,

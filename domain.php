@@ -28,6 +28,7 @@ $db       = getDB();
 $user     = $auth->user();
 $canWrite = in_array($user['role'], ['admin', 'operator'], true);
 $dns      = new DNSLookup();
+$flattener = new SPFFlattener();
 
 $domainId = sanitizeInt($_GET['id'] ?? 0);
 
@@ -358,65 +359,72 @@ $csrf = generateCSRFToken();
     </div>
 
     <?php
-    // Rebuild the record chain for display from the stored addresses.
-    $chain = [];
-    if (!empty($flattenedIps)) {
-        $ipTokens = array_map(fn($r) => $r['ip_address'], $flattenedIps);
-        $collapsed = IPUtil::collapse($ipTokens);
-        $f = new SPFFlattener();
-        $blocks = [];
-        $budget = SPF_RECORD_BYTES;
-        // Re-pack using the same rules the flattener used.
-        $tokens = $collapsed['spf'];
-        $blocks = [$tokens];
-        for ($i = 0; $i < count($blocks); $i++) {
-            while (!empty($blocks[$i])) {
-                $body = implode(' ', $blocks[$i]);
-                $size = strlen("v=spf1 {$body} include:spf1.example.domain.com -all") + 49;
-                if ($size < $budget) break;
-                $overflow = array_pop($blocks[$i]);
-                if (!isset($blocks[$i + 1])) $blocks[$i + 1] = [];
-                array_unshift($blocks[$i + 1], $overflow);
-            }
-        }
-        $blocks = array_values(array_filter($blocks, fn($b) => !empty($b)));
-        $last = count($blocks) - 1;
-        foreach ($blocks as $i => $block) {
-            $body = implode(' ', $block);
-            $content = ($i === $last)
-                ? "v=spf1 {$body} -all"
-                : 'v=spf1 ' . $body . ' include:spf' . ($i + 1) . ".{$domain['domain']} -all";
-            $chain[] = ['name' => "spf{$i}.{$domain['domain']}", 'content' => $content];
-        }
+    // The chain is read from storage, which is what was actually generated
+    // and is what gets published — not recomputed for display.
+    $chain = $flattener->getRecordChain($domainId);
+
+    // Fall back to the stored single record for chains flattened before the
+    // chain table existed.
+    if (empty($chain) && !empty($domain['flattened_spf_record'])) {
+        $chain = [[
+            'record_name' => "spf0.{$domain['domain']}",
+            'content'     => $domain['flattened_spf_record'],
+            'char_length' => strlen($domain['flattened_spf_record']),
+            'published_at' => null,
+        ]];
     }
     ?>
 
-    <?php if (count($chain) > 1): ?>
+    <?php if (!empty($chain)): ?>
       <div class="card">
         <div class="card__head">
           <div>
-            <div class="card__title"><?= count($chain) ?> chained sub-records</div>
+            <div class="card__title">
+              <?= count($chain) ?> generated record<?= count($chain) === 1 ? '' : 's' ?>
+            </div>
             <div class="card__sub">
-              Each costs one DNS lookup. Create all of them, then point the apex at
-              <span class="inline-code">spf0.<?= htmlspecialchars($domain['domain']) ?></span>.
+              <?php if (count($chain) > 1): ?>
+                Each costs one DNS lookup. Create all of them, then point the apex at
+                <span class="inline-code">spf0.<?= htmlspecialchars($domain['domain']) ?></span>.
+              <?php else: ?>
+                Publish this at the apex, or point the apex anchor at
+                <span class="inline-code">spf0.<?= htmlspecialchars($domain['domain']) ?></span>.
+              <?php endif; ?>
             </div>
           </div>
+          <?php
+          $published = array_filter($chain, fn($r) => !empty($r['published_at']));
+          if (!empty($published)):
+          ?>
+            <span class="badge badge-ok">
+              Published <?= htmlspecialchars(date('d M Y H:i', strtotime(reset($published)['published_at']))) ?>
+            </span>
+          <?php endif; ?>
         </div>
 
-        <div class="alert alert-info">
-          <span class="alert__icon">i</span>
-          <div>
-            A single DNS character-string is limited to 255 characters. These records
-            exceed that, so publish each one as <strong>multiple quoted strings inside
-            one TXT record</strong> — use the BIND format below.
+        <?php if (count($chain) > 1): ?>
+          <div class="alert alert-info">
+            <span class="alert__icon">i</span>
+            <div>
+              A single DNS character-string is limited to 255 characters. Records longer
+              than that must be published as <strong>multiple quoted strings inside one
+              TXT record</strong> — use the BIND format below. Every record shown here is
+              required: <span class="inline-code">spf0</span> includes
+              <span class="inline-code">spf1</span>, and so on down the chain.
+            </div>
           </div>
-        </div>
+        <?php endif; ?>
 
-        <?php foreach ($chain as $rec): ?>
+        <?php foreach ($chain as $i => $rec): ?>
           <div class="collapsible" onclick="toggleCollapse(this)">
-            <span><span class="inline-code"><?= htmlspecialchars($rec['name']) ?></span></span>
+            <span>
+              <span class="inline-code"><?= htmlspecialchars($rec['record_name']) ?></span>
+              <?php if (!empty($rec['is_last'])): ?>
+                <span class="badge badge-neutral">terminal</span>
+              <?php endif; ?>
+            </span>
             <span class="badge badge-neutral">
-              <?= strlen($rec['content']) ?> chars<span class="collapsible__chev">›</span>
+              <?= (int) ($rec['char_length'] ?: strlen($rec['content'])) ?> chars<span class="collapsible__chev">›</span>
             </span>
           </div>
           <div class="collapsible-body">
@@ -427,9 +435,9 @@ $csrf = generateCSRFToken();
             </div>
             <div class="spf-record mb-16"><?= htmlspecialchars($rec['content']) ?></div>
 
-            <?php $bind = $f->formatForBind($rec['content']); ?>
+            <?php $bind = $flattener->formatForBind($rec['content']); ?>
             <div class="flex-between mb-8">
-              <span class="muted" style="font-size:12px">BIND / multi-string format (publish this)</span>
+              <span class="muted" style="font-size:12px">BIND / multi-string format (publish this for long records)</span>
               <button class="btn btn-outline btn-sm" type="button"
                       onclick="copyText(<?= htmlspecialchars(json_encode($bind), ENT_QUOTES) ?>, this)">Copy</button>
             </div>

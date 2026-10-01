@@ -188,17 +188,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $s->execute([$domainId]);
         $name = $s->fetchColumn();
 
-        $msg = "Flattened {$name}: " . count($result['ips_collected']) . ' IP(s), '
-             . $result['lookup_count_before'] . ' lookup(s) → 0.';
+        $chainCount = count($result['record_set']['records'] ?? []);
+        $lookupsAfter = $result['record_set']['lookups'] ?? 0;
+
+        $msg = "Flattened {$name}: " . count($result['ips_collected']) . ' IP(s) across '
+             . $chainCount . ' record' . ($chainCount === 1 ? '' : 's') . ', '
+             . $result['lookup_count_before'] . ' lookup(s) → ' . $lookupsAfter . '.';
 
         $auth->auditCurrent('SPF_FLATTENED', $msg, $name);
 
         if ($push && $name) {
+            // Publishing the apex alone would leave the chain broken, so
+            // every generated record is written.
             try {
                 $cf = new CloudflareAPI();
-                $cf->updateDomainSPF($name, $result['flattened_record']);
-                $auth->auditCurrent('CLOUDFLARE_PUSHED', "Published flattened SPF for {$name}", $name);
-                $msg .= ' Published to Cloudflare.';
+                $records = $result['record_set']['records'] ?? [];
+
+                // Cloudflare zones are found by suffix, so the chain is
+                // written against the domain itself.
+                $outcome = $cf->publishChain($name, $records);
+
+                if (!empty($outcome['updated'])) {
+                    $flattener->markChainPublished($domainId);
+                    $auth->auditCurrent('CLOUDFLARE_PUSHED',
+                        'Published ' . count($outcome['updated']) . ' record(s): '
+                        . implode(', ', $outcome['updated']), $name);
+                    $msg .= ' Published ' . count($outcome['updated']) . ' record(s) to Cloudflare.';
+                }
+
+                if (!empty($outcome['failed'])) {
+                    $names = implode(', ', array_column($outcome['failed'], 'name'));
+                    $auth->auditCurrent('CLOUDFLARE_PUSH_FAILED', "Failed: {$names}", $name);
+                    setFlash($msg . " Failed to publish: {$names}.", 'warning');
+                    header('Location: index.php');
+                    exit;
+                }
             } catch (Exception $e) {
                 error_log('Cloudflare push failed: ' . $e->getMessage());
                 $auth->auditCurrent('CLOUDFLARE_PUSH_FAILED', $e->getMessage(), $name);
@@ -414,6 +438,16 @@ $csrf          = generateCSRFToken();
                         <input type="hidden" name="domain_id" value="<?= (int) $d['id'] ?>">
                         <button class="btn btn-primary btn-sm" type="submit">Flatten</button>
                       </form>
+                      <?php if ($d['cloudflare_zone_id']): ?>
+                      <form method="post" style="display:inline"
+                            onsubmit="return confirm('Flatten <?= htmlspecialchars($d['domain'], ENT_QUOTES) ?> and publish every record in the chain to Cloudflare?')">
+                        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf) ?>">
+                        <input type="hidden" name="action" value="flatten">
+                        <input type="hidden" name="domain_id" value="<?= (int) $d['id'] ?>">
+                        <input type="hidden" name="push_cloudflare" value="1">
+                        <button class="btn btn-cyan btn-sm" type="submit" title="Flatten, then write every generated record to Cloudflare">Flatten &amp; Publish</button>
+                      </form>
+                      <?php endif; ?>
                       <?php endif; ?>
 
                       <?php if ($d['flattened_spf_record']): ?>

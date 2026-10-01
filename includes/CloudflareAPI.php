@@ -119,6 +119,77 @@ class CloudflareAPI {
     }
     
     /**
+     * Publish a complete SPF record chain to Cloudflare.
+     *
+     * spf0.<domain> references spf1.<domain> and so on, so every record must
+     * exist or SPF evaluation fails with a PermError. Sub-records are written
+     * first: that way the chain is already resolvable when the apex anchor is
+     * updated to point at it.
+     *
+     * @param string $domain  Sending domain (the chain's suffix)
+     * @param array  $records [['name' => 'spf0.example.com', 'content' => 'v=spf1 …'], …]
+     * @return array{updated:array,failed:array}
+     */
+    public function publishChain($domain, array $records) {
+        $updated = [];
+        $failed  = [];
+
+        if (empty($records)) {
+            return ['updated' => $updated, 'failed' => $failed];
+        }
+
+        $zoneId = $this->getZoneId($domain);
+
+        foreach ($records as $rec) {
+            $name = $rec['name'];
+            $value = $rec['content'];
+
+            try {
+                $existing = $this->getTxtRecord($zoneId, $name);
+
+                if ($existing) {
+                    $this->updateSPFRecord($zoneId, $existing['id'], $value, $existing['proxied']);
+                } else {
+                    $this->createSPFRecord($zoneId, $name, $value);
+                }
+                $updated[] = $name;
+            } catch (Exception $e) {
+                error_log("Cloudflare push failed for {$name}: " . $e->getMessage());
+                $failed[] = ['name' => $name, 'error' => $e->getMessage()];
+            }
+        }
+
+        return ['updated' => $updated, 'failed' => $failed];
+    }
+
+    /**
+     * Find the SPF/authorisation TXT record for an exact name.
+     *
+     * getSPFRecord() above deliberately searches the apex for a v=spf1
+     * record; sub-records also begin with v=spf1, so the same matching works
+     * for any name in the chain.
+     */
+    public function getTxtRecord($zoneId, $name) {
+        $response = $this->request(
+            'GET',
+            "/zones/{$zoneId}/dns_records?type=TXT&name=" . urlencode($name)
+        );
+
+        foreach ($response['result'] as $record) {
+            $content = trim($record['content'], '"');
+            if (strpos($content, 'v=spf1') === 0) {
+                return [
+                    'id'      => $record['id'],
+                    'content' => $content,
+                    'proxied' => $record['proxied'] ?? false,
+                ];
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Update SPF record for a domain (main method)
      */
     public function updateDomainSPF($domain, $spfContent) {

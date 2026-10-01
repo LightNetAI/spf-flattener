@@ -131,6 +131,7 @@ class SPFFlattener {
 
             $this->saveFlatteningResult($domainId, $recordSet['root'], count($uniqueIps));
             $this->storeFlattenedIps($domainId, $uniqueIps);
+            $this->storeRecordChain($domainId, $recordSet['records']);
 
         } catch (Throwable $e) {
             $result['errors'][] = $e->getMessage();
@@ -651,6 +652,70 @@ class SPFFlattener {
     /* ========================================================
      * Persistence
      * ====================================================== */
+
+    /**
+     * Persist the whole generated record chain.
+     *
+     * All records must be stored: spf0 references spf1, so publishing or
+     * displaying only the first one leaves the zone broken.
+     */
+    private function storeRecordChain($domainId, array $records) {
+        if (empty($records)) {
+            return;
+        }
+
+        // Supersede the previous set rather than deleting it, so a partly
+        // published chain can still be inspected afterwards.
+        $stmt = $this->db->prepare("UPDATE flattened_records SET is_active = 0 WHERE domain_id = ?");
+        $stmt->execute([$domainId]);
+
+        $stmt = $this->db->prepare("
+            INSERT INTO flattened_records
+                (domain_id, seq, record_name, content, char_length, is_last, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+            ON DUPLICATE KEY UPDATE
+                content = VALUES(content),
+                char_length = VALUES(char_length),
+                is_last = VALUES(is_last),
+                is_active = 1
+        ");
+
+        $last = count($records) - 1;
+        foreach (array_values($records) as $i => $rec) {
+            $stmt->execute([
+                $domainId,
+                $i,
+                $rec['name'],
+                $rec['content'],
+                strlen($rec['content']),
+                $i === $last ? 1 : 0,
+            ]);
+        }
+    }
+
+    /**
+     * The stored chain for a domain, in order.
+     */
+    public function getRecordChain($domainId) {
+        $stmt = $this->db->prepare("
+            SELECT * FROM flattened_records
+             WHERE domain_id = ? AND is_active = 1
+             ORDER BY seq
+        ");
+        $stmt->execute([$domainId]);
+        return $stmt->fetchAll();
+    }
+
+    /**
+     * Mark every record in a domain's chain as published.
+     */
+    public function markChainPublished($domainId) {
+        $stmt = $this->db->prepare("
+            UPDATE flattened_records SET published_at = NOW()
+             WHERE domain_id = ? AND is_active = 1
+        ");
+        $stmt->execute([$domainId]);
+    }
 
     private function saveFlatteningResult($domainId, $flattenedRecord, $ipCount) {
         $stmt = $this->db->prepare("

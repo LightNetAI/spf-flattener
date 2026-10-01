@@ -11,10 +11,17 @@ branded web GUI with username / password authentication.
 **SPF flattening (cfspflat parity)**
 - Resolves `include:` chains recursively to concrete `ip4:` / `ip6:` entries
 - Handles `a:`, `mx:` and `redirect=` mechanisms
+- **Collapses addresses into the minimal CIDR set** — overlapping and
+  adjacent ranges are merged, so a few hundred addresses become a handful of
+  networks (the same work `netaddr.IPSet.iter_cidrs()` does upstream)
 - Counts DNS lookups per RFC 7208 (10-lookup limit)
-- Deduplicates addresses and sorts IPv4 before IPv6
-- Emits the root record plus chained `spf<n>.<domain>` sub-records when the
-  address set will not fit inside the 255-character TXT limit
+- Splits the result across `spf0.<domain>`, `spf1.<domain>` … using the same
+  450-byte packing budget as upstream, chaining each record forward with
+  `include:` and terminating every one with `-all`
+- **Stores the complete chain**, because publishing only the first record
+  leaves the chain broken
+- Renders the BIND/multi-string form (four tokens per quoted string) for
+  records longer than one DNS character-string
 
 **DNS import**
 - Fetches the live SPF record over DNS (`dig`, with `nslookup` fallback)
@@ -292,6 +299,7 @@ See `SECURITY_AUDIT.md` for the full assessment.
 | `sending_domains` | Envelope domains per zone                       |
 | `approved_senders`| `include:` and `ip4:`/`ip6:` authorisations     |
 | `flattened_ips`   | Resolved addresses                              |
+| `flattened_records`| The generated spf0/spf1/… record chain          |
 | `change_log`      | Detected IP additions / removals                |
 | `email_queue`     | Pending notifications                           |
 | `dns_cache`       | Cached DNS answers                              |
