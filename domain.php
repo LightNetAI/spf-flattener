@@ -12,6 +12,7 @@ require_once __DIR__ . '/includes/Setup.php';
 require_once __DIR__ . '/includes/layout.php';
 require_once __DIR__ . '/includes/SPFFlattener.php';
 require_once __DIR__ . '/includes/DNSLookup.php';
+require_once __DIR__ . '/includes/IPUtil.php';
 
 // Not installed yet? Send the user to the installer.
 if (!Setup::isInstalled()) {
@@ -355,6 +356,88 @@ $csrf = generateCSRFToken();
         </div>
       <?php endif; ?>
     </div>
+
+    <?php
+    // Rebuild the record chain for display from the stored addresses.
+    $chain = [];
+    if (!empty($flattenedIps)) {
+        $ipTokens = array_map(fn($r) => $r['ip_address'], $flattenedIps);
+        $collapsed = IPUtil::collapse($ipTokens);
+        $f = new SPFFlattener();
+        $blocks = [];
+        $budget = SPF_RECORD_BYTES;
+        // Re-pack using the same rules the flattener used.
+        $tokens = $collapsed['spf'];
+        $blocks = [$tokens];
+        for ($i = 0; $i < count($blocks); $i++) {
+            while (!empty($blocks[$i])) {
+                $body = implode(' ', $blocks[$i]);
+                $size = strlen("v=spf1 {$body} include:spf1.example.domain.com -all") + 49;
+                if ($size < $budget) break;
+                $overflow = array_pop($blocks[$i]);
+                if (!isset($blocks[$i + 1])) $blocks[$i + 1] = [];
+                array_unshift($blocks[$i + 1], $overflow);
+            }
+        }
+        $blocks = array_values(array_filter($blocks, fn($b) => !empty($b)));
+        $last = count($blocks) - 1;
+        foreach ($blocks as $i => $block) {
+            $body = implode(' ', $block);
+            $content = ($i === $last)
+                ? "v=spf1 {$body} -all"
+                : 'v=spf1 ' . $body . ' include:spf' . ($i + 1) . ".{$domain['domain']} -all";
+            $chain[] = ['name' => "spf{$i}.{$domain['domain']}", 'content' => $content];
+        }
+    }
+    ?>
+
+    <?php if (count($chain) > 1): ?>
+      <div class="card">
+        <div class="card__head">
+          <div>
+            <div class="card__title"><?= count($chain) ?> chained sub-records</div>
+            <div class="card__sub">
+              Each costs one DNS lookup. Create all of them, then point the apex at
+              <span class="inline-code">spf0.<?= htmlspecialchars($domain['domain']) ?></span>.
+            </div>
+          </div>
+        </div>
+
+        <div class="alert alert-info">
+          <span class="alert__icon">i</span>
+          <div>
+            A single DNS character-string is limited to 255 characters. These records
+            exceed that, so publish each one as <strong>multiple quoted strings inside
+            one TXT record</strong> — use the BIND format below.
+          </div>
+        </div>
+
+        <?php foreach ($chain as $rec): ?>
+          <div class="collapsible" onclick="toggleCollapse(this)">
+            <span><span class="inline-code"><?= htmlspecialchars($rec['name']) ?></span></span>
+            <span class="badge badge-neutral">
+              <?= strlen($rec['content']) ?> chars<span class="collapsible__chev">›</span>
+            </span>
+          </div>
+          <div class="collapsible-body">
+            <div class="flex-between mb-8">
+              <span class="muted" style="font-size:12px">Single line</span>
+              <button class="btn btn-outline btn-sm" type="button"
+                      onclick="copyText(<?= htmlspecialchars(json_encode($rec['content']), ENT_QUOTES) ?>, this)">Copy</button>
+            </div>
+            <div class="spf-record mb-16"><?= htmlspecialchars($rec['content']) ?></div>
+
+            <?php $bind = $f->formatForBind($rec['content']); ?>
+            <div class="flex-between mb-8">
+              <span class="muted" style="font-size:12px">BIND / multi-string format (publish this)</span>
+              <button class="btn btn-outline btn-sm" type="button"
+                      onclick="copyText(<?= htmlspecialchars(json_encode($bind), ENT_QUOTES) ?>, this)">Copy</button>
+            </div>
+            <div class="spf-record spf-record--light" style="color:var(--text)"><?= htmlspecialchars($bind) ?></div>
+          </div>
+        <?php endforeach; ?>
+      </div>
+    <?php endif; ?>
 
     <?php if (!empty($flattenedIps)): ?>
       <div class="card">

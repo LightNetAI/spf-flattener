@@ -9,6 +9,7 @@
  */
 
 require_once __DIR__ . '/Security.php';
+require_once __DIR__ . '/IPUtil.php';
 
 class SPFFlattener {
     private $db;
@@ -506,89 +507,145 @@ class SPFFlattener {
     }
 
     /**
-     * Build the root record plus any chained sub-records needed to hold
-     * every address inside the 255-character DNS limit.
+     * Build the record set the way cfspflat does.
      *
-     * @return array{root:string,chained:array,lookups:int}
+     * Records are packed to a byte budget (450 bytes, matching upstream's
+     * fit_bytes), each one terminated with -all, and chained forward with
+     * include:spf<N+1>.<domain> — the final record carries no include.
+     *
+     * @param array  $ips      Deduplicated ['ip','version',...] records
+     * @param string $domain   Sending domain
+     * @param array  $warnings Collected by reference
+     * @return array{root:string,records:array,lookups:int,tokens:int}
      */
     private function buildRecordSet($ips, $domain, &$warnings) {
-        $prefix = 'v=spf1';
-        $suffix = '~all';
-
-        // IPv4 first, then IPv6 — mirrors cfspflat's ordering.
-        usort($ips, function ($a, $b) {
-            if ($a['version'] === $b['version']) {
-                return strcmp($a['ip'], $b['ip']);
-            }
-            return $a['version'] === '4' ? -1 : 1;
-        });
-
-        $mechanisms = [];
+        // Collapse addresses to the minimal set of CIDRs, exactly as
+        // netaddr.IPSet(...).iter_cidrs() does upstream.
+        $tokens = [];
         foreach ($ips as $ipData) {
-            $mechanisms[] = ($ipData['version'] === '4' ? 'ip4:' : 'ip6:') . $ipData['ip'];
+            $tokens[] = $ipData['ip'];
         }
 
-        // Pack mechanisms into chunks that fit the 255-char TXT limit.
-        $chunks = [];
-        $current = [];
-        $length = strlen($prefix);
+        $collapsed = IPUtil::collapse($tokens);
+        $spfTokens = $collapsed['spf'];
 
-        foreach ($mechanisms as $mech) {
-            $extra = strlen($mech) + 1; // leading space
-            if ($length + $extra > MAX_SPF_LENGTH - strlen($suffix) - 1 && !empty($current)) {
-                $chunks[] = $current;
-                $current = [];
-                $length = strlen($prefix);
+        if (empty($spfTokens)) {
+            return ['root' => 'v=spf1 -all', 'records' => [], 'lookups' => 0, 'tokens' => 0];
+        }
+
+        // Pack tokens into records within the byte budget.
+        $budget = defined('SPF_RECORD_BYTES') ? SPF_RECORD_BYTES : 450;
+        $blocks = $this->fitBytes($spfTokens, $budget);
+
+        $records = [];
+        $lastIndex = count($blocks) - 1;
+
+        foreach ($blocks as $i => $block) {
+            $body = implode(' ', $block);
+            if ($i === $lastIndex) {
+                $record = "v=spf1 {$body} -all";
+            } else {
+                // Chained forward to the next record, mirroring upstream.
+                $record = 'v=spf1 ' . $body . ' include:spf' . ($i + 1) . ".{$domain} -all";
             }
-            $current[] = $mech;
-            $length += $extra;
-        }
-        if (!empty($current)) {
-            $chunks[] = $current;
-        }
-
-        if (empty($chunks)) {
-            return ['root' => 'v=spf1 ~all', 'chained' => [], 'lookups' => 0];
-        }
-
-        // Single chunk: the flattened record is completely lookup-free.
-        if (count($chunks) === 1) {
-            $root = $prefix . ' ' . implode(' ', $chunks[0]) . ' ' . $suffix;
-            if (strlen($root) > MAX_SPF_LENGTH) {
-                $warnings[] = 'Record exceeds the 255-character DNS limit.';
-            }
-            return ['root' => $root, 'chained' => [], 'lookups' => 0];
-        }
-
-        // Multiple chunks: publish sub-records and chain them with
-        // include:, exactly as cfspflat does. The chains each cost one
-        // lookup, so the count is reported honestly.
-        $base = preg_replace('/^www\./', '', strtolower($domain));
-        $chained = [];
-        $chainNames = [];
-
-        foreach ($chunks as $i => $chunk) {
-            $name = "spf{$i}.{$base}";
-            $chained[] = [
-                'name'    => $name,
-                'content' => $prefix . ' ' . implode(' ', $chunk) . ' ' . $suffix,
+            $records[] = [
+                'name'    => "spf{$i}.{$domain}",
+                'content' => $record,
             ];
-            $chainNames[] = $name;
         }
 
-        $root = $prefix;
-        foreach ($chainNames as $name) {
-            $candidate = $root . ' include:' . $name;
-            if (strlen($candidate) + strlen($suffix) + 1 > MAX_SPF_LENGTH) {
-                $warnings[] = 'Too many chained sub-records to fit in the root record; '
-                            . 'consider removing unused senders.';
+        // The root record is the first link in the chain.
+        $root = $records[0]['content'];
+
+        // 255 is the limit for a single DNS character-string, not for a whole
+        // TXT record: longer records are published as several quoted strings
+        // inside one record. formatForBind() renders that form.
+        foreach ($records as $rec) {
+            if (strlen($rec['content']) > MAX_SPF_LENGTH) {
+                $warnings[] = "Record {$rec['name']} is " . strlen($rec['content'])
+                            . ' characters and must be published as multiple quoted '
+                            . 'strings (see the BIND format in the detail view).';
                 break;
             }
-            $root = $candidate;
         }
-        $root .= ' ' . $suffix;
 
-        return ['root' => $root, 'chained' => $chained, 'lookups' => count($chainNames)];
+        return [
+            'root'    => $root,
+            'records' => $records,
+            'lookups' => count($records),
+            'tokens'  => count($spfTokens),
+        ];
+    }
+
+    /**
+     * Render a record as quoted 255-character-safe strings, the format used
+     * in zone files and by many DNS providers.
+     *
+     * Mirrors sender_policy_flattener's format_rrecord_value_for_bind(),
+     * which wraps four tokens per line.
+     *
+     * @return string
+     */
+    public function formatForBind($record) {
+        $tokens = preg_split('/\s+/', trim($record));
+        $out = '( ';
+        $line = '';
+        $count = 0;
+
+        foreach ($tokens as $token) {
+            $line .= $token . ' ';
+            $count++;
+            if ($count === 4) {
+                $out .= '"' . $line . '" ';
+                $line = '';
+                $count = 0;
+            }
+        }
+        if ($line !== '') {
+            $out .= '"' . $line . '"';
+        }
+        $out = rtrim($out) . ' )';
+
+        return $out;
+    }
+
+    /**
+     * Pack SPF tokens into blocks that stay inside the byte budget.
+     *
+     * Mirrors sender_policy_flattener's fit_bytes(): start with one block
+     * and move the last token into a new block until each fits. Upstream
+     * measures with sys.getsizeof(), which includes interpreter overhead,
+     * so the same budget is applied here for comparable output.
+     *
+     * @param int $budget Upper bound in bytes when the record is serialised
+     * @return array List of blocks, each a list of tokens
+     */
+    private function fitBytes(array $tokens, $budget) {
+        $blocks = [array_values($tokens)];
+
+        for ($index = 0; $index < count($blocks); $index++) {
+            while ($this->measureRecord($blocks[$index]) >= $budget && !empty($blocks[$index])) {
+                $overflow = array_pop($blocks[$index]);
+                if (!isset($blocks[$index + 1])) {
+                    $blocks[$index + 1] = [];
+                }
+                // Upstream appends the overflow to the front of the next block.
+                array_unshift($blocks[$index + 1], $overflow);
+            }
+        }
+
+        // Drop any block that ended up empty.
+        return array_values(array_filter($blocks, fn($b) => !empty($b)));
+    }
+
+    /**
+     * Approximate the serialised size of a record built from these tokens.
+     * The 49-byte constant accounts for sys.getsizeof() overhead so the
+     * budget behaves like upstream's.
+     */
+    private function measureRecord(array $tokens) {
+        $body = implode(' ', $tokens);
+        return strlen("v=spf1 {$body} include:spf1.example.domain.com -all") + 49;
     }
 
     /* ========================================================
