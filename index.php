@@ -417,7 +417,9 @@ $csrf          = generateCSRFToken();
                       <?php endif; ?>
 
                       <?php if ($d['flattened_spf_record']): ?>
-                        <button class="btn btn-outline btn-sm"
+                        <button class="btn btn-outline btn-sm" type="button"
+                                data-target="rec-<?= (int) $d['id'] ?>"
+                                aria-expanded="false"
                                 onclick="toggleCollapse(this)">View<span class="collapsible__chev">›</span></button>
                       <?php endif; ?>
 
@@ -433,7 +435,7 @@ $csrf          = generateCSRFToken();
                     </div>
 
                     <?php if ($d['flattened_spf_record']): ?>
-                      <div class="collapsible-body">
+                      <div class="collapsible-body" id="rec-<?= (int) $d['id'] ?>">
                         <div class="flex-between mb-8">
                           <span class="muted" style="font-size:12px">Flattened SPF record</span>
                           <button class="btn btn-outline btn-sm" type="button"

@@ -163,10 +163,40 @@
   window.addEventListener('hashchange', activateTabFromHash);
 
   /* ---- Collapsibles ---------------------------------------- */
+  /**
+   * Toggle a collapsible body.
+   *
+   * Prefers the element named by data-target, because nextElementSibling is
+   * unreliable: in the domains table the View button sits inside a flex
+   * container alongside its form elements, so its sibling is not the panel.
+   * Falls back to the next sibling for the senders list, where the trigger
+   * and the body are adjacent.
+   */
   window.toggleCollapse = function (el) {
-    el.classList.toggle('open');
-    var body = el.nextElementSibling;
-    if (body) body.classList.toggle('show');
+    var body = null;
+
+    var targetId = el.getAttribute && el.getAttribute('data-target');
+    if (targetId) {
+      body = document.getElementById(targetId);
+    }
+
+    if (!body) {
+      body = el.nextElementSibling;
+      // Skip over form controls that may sit between the trigger and the body.
+      var guard = 0;
+      while (body && !body.classList.contains('collapsible-body') && guard < 5) {
+        body = body.nextElementSibling;
+        guard++;
+      }
+    }
+
+    if (!body) return;
+
+    var open = el.classList.toggle('open');
+    body.classList.toggle('show', open);
+    if (el.hasAttribute && el.hasAttribute('aria-expanded')) {
+      el.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
   };
 
   /* ---- Copy to clipboard ----------------------------------- */
