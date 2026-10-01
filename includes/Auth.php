@@ -165,8 +165,13 @@ class Auth {
             return false;
         }
 
-        // Bind the session to the client fingerprint.
-        if (($_SESSION['fingerprint'] ?? '') !== $this->fingerprint()) {
+        // Bind the session to the client fingerprint. If a session predates
+        // the fingerprint (or it was never stored), adopt the current value
+        // instead of destroying a legitimate session.
+        $current = $this->fingerprint();
+        if (empty($_SESSION['fingerprint'])) {
+            $_SESSION['fingerprint'] = $current;
+        } elseif (!hash_equals($_SESSION['fingerprint'], $current)) {
             $this->logout('Session fingerprint mismatch', 'SESSION_INVALID');
             return false;
         }
@@ -434,11 +439,21 @@ class Auth {
         return defined('PASSWORD_ARGON2ID') ? PASSWORD_ARGON2ID : PASSWORD_BCRYPT;
     }
 
+    /**
+     * A light client binding for the session.
+     *
+     * Deliberately based on the User-Agent only. An earlier version also
+     * hashed REMOTE_ADDR, which locks users out mid-session whenever their
+     * apparent address changes — dual-stack IPv4/IPv6, a proxy or load
+     * balancer, a mobile network handover, or any privacy tool. That
+     * surfaced as a spurious "Not authenticated" on the next AJAX call.
+     *
+     * The real protections are the session id's entropy, HttpOnly +
+     * SameSite cookies, regeneration on login, and the idle timeout.
+     */
     private function fingerprint() {
         $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
-        $ip = $this->clientIp();
-        // Bind to UA + IP; salted with a constant so it is not reversible.
-        return hash('sha256', $ua . '|' . $ip . '|spf-flattener');
+        return hash('sha256', $ua . '|spf-flattener');
     }
 
     private function clientIp() {

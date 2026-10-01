@@ -722,12 +722,12 @@ async function fetchSPF() {
   fd.append('csrf_token', CSRF);
 
   try {
-    const res = await fetch('import_spf.php', { method: 'POST', body: fd });
+    const res = await fetch('import_spf.php', { method: 'POST', body: fd, credentials: 'same-origin' });
     const out = await decodeJson(res);
 
     if (!out.success) {
-      box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
-        + escapeHtml(out.error || 'No SPF record found.') + '</div></div>';
+      box.innerHTML = sessionNotice(res, out) || ('<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
+        + escapeHtml(out.error || 'No SPF record found.') + '</div></div>');
       return;
     }
 
@@ -795,7 +795,7 @@ async function importSPF() {
   fd.append('csrf_token', CSRF);
 
   try {
-    const res = await fetch('import_spf.php', { method: 'POST', body: fd });
+    const res = await fetch('import_spf.php', { method: 'POST', body: fd, credentials: 'same-origin' });
     const out = await decodeJson(res);
 
     if (out.success) {
@@ -805,8 +805,8 @@ async function importSPF() {
       return;
     }
 
-    box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
-      + escapeHtml((out.errors && out.errors.join(' ')) || out.error || 'Import failed.') + '</div></div>';
+    box.innerHTML = sessionNotice(res, out) || ('<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
+      + escapeHtml((out.errors && out.errors.join(' ')) || out.error || 'Import failed.') + '</div></div>');
   } catch (e) {
     box.innerHTML = '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
       + escapeHtml(e.message) + '</div></div>';
@@ -825,7 +825,10 @@ async function decodeJson(res) {
     return JSON.parse(text);
   } catch (e) {
     if (res.status === 401) {
-      return { success: false, error: 'Your session expired. Reload the page and sign in again.' };
+      return {
+        success: false,
+        error: 'Your session has expired. Reload the page and sign in again.'
+      };
     }
     // Strip tags so the raw HTML does not end up in the message.
     const plain = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -835,6 +838,31 @@ async function decodeJson(res) {
            + (plain ? plain.slice(0, 200) : 'No response body.')
     };
   }
+}
+
+/**
+ * Build an actionable panel when the server rejected the request for
+ * authentication reasons, instead of a bare "Not authenticated".
+ * Returns null when the response is not an auth problem.
+ */
+function sessionNotice(res, out) {
+  const msg = String((out && out.error) || '');
+  const isAuth = res.status === 401 || /not authenticated/i.test(msg);
+  const isCsrf = res.status === 403 || /csrf/i.test(msg);
+
+  if (!isAuth && !isCsrf) return null;
+
+  const heading = isAuth ? 'Your session has ended' : 'Your request was rejected';
+  const detail  = isAuth
+    ? 'You were signed out, or the browser did not send your session cookie.'
+    : 'The security token did not match. This usually means the page is stale.';
+
+  return '<div class="alert alert-error"><span class="alert__icon">✕</span><div>'
+       + '<strong>' + escapeHtml(heading) + '</strong><br>'
+       + escapeHtml(detail) + '<br><br>'
+       + '<a class="btn btn-outline btn-sm" href="login.php?next=' + encodeURIComponent(window.location.pathname) + '">Sign in again</a> '
+       + '<button class="btn btn-outline btn-sm" type="button" onclick="window.location.reload()">Reload page</button>'
+       + '</div></div>';
 }
 
 function escapeHtml(s) {
