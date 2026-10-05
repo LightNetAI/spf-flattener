@@ -239,6 +239,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $msg .= ' Published ' . count($outcome['updated']) . ' record(s) to Cloudflare.';
                 }
 
+                // The apex is never written; say so rather than leaving it
+                // ambiguous whether it was published.
+                if (!empty($outcome['skipped'])) {
+                    $anchorName = $outcome['skipped'][0]['name'];
+                    $auth->auditCurrent('CLOUDFLARE_APEX_SKIPPED',
+                        "Left {$anchorName} untouched; point its TXT at the chain manually", $name);
+                    $msg .= " The apex record ({$anchorName}) was left untouched — "
+                          . 'point it at the chain yourself when you are ready.';
+                }
+
                 if (!empty($outcome['failed'])) {
                     // Group by reason so six records failing for one cause read
                     // as one problem, not six.
@@ -261,10 +271,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     header('Location: index.php');
                     exit;
                 }
-            } catch (Exception $e) {
+            } catch (Throwable $e) {
                 error_log('Cloudflare push failed: ' . $e->getMessage());
                 $auth->auditCurrent('CLOUDFLARE_PUSH_FAILED', $e->getMessage(), $name);
-                setFlash($msg . ' Cloudflare publish failed.', 'warning');
+                // Name the reason: "publish failed" alone gives nothing to act on.
+                setFlash($msg . ' Cloudflare publish failed: ' . $e->getMessage(), 'warning');
                 header('Location: index.php');
                 exit;
             }

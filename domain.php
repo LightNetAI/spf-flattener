@@ -308,18 +308,8 @@ $csrf = generateCSRFToken();
             </div>
           <?php endif; ?>
 
-          <?php if (!empty($snap['txt_records_list'])): ?>
-            <p class="form-hint">All TXT records returned for <?= htmlspecialchars($domain['domain']) ?> at import time (<?= count($snap['txt_records_list']) ?>)</p>
-            <div class="mech-list">
-              <?php foreach ($snap['txt_records_list'] as $txt): ?>
-                <?php $isSpf = stripos(trim($txt), 'v=spf1') === 0; ?>
-                <div class="mech-item <?= $isSpf ? 'mech-item--ip4' : '' ?>" style="word-break:break-all">
-                  <?= htmlspecialchars($txt) ?>
-                  <?php if ($isSpf): ?><span class="badge badge-ok">SPF</span><?php endif; ?>
-                </div>
-              <?php endforeach; ?>
-            </div>
-          <?php endif; ?>
+          <?php /* Non-SPF TXT records are not shown: only the SPF record and the
+                   mechanisms parsed from it are relevant to flattening. */ ?>
         </div>
       <?php endforeach; ?>
     <?php endif; ?>

@@ -235,42 +235,39 @@ class CloudflareAPI {
      * different zone from the spfN records, so the zone is resolved per record
      * name rather than once for the whole set.
      *
+     * The anchor is deliberately NOT published. Its live value is the
+     * operator's to set: overwriting the apex of a domain that is already
+     * sending could break its mail. It comes back in `skipped`.
+     *
      * @param string $domain  Sending domain (the anchor's name and chain suffix)
      * @param array  $records [['name' => …, 'content' => …], …]
-     * @return array{updated:array,failed:array}
+     * @return array{updated:array,failed:array,skipped:array}
      */
     public function publishChain($domain, array $records) {
         $updated = [];
         $failed  = [];
+        $skipped = [];
 
         if (empty($records)) {
-            return ['updated' => $updated, 'failed' => $failed];
+            return ['updated' => $updated, 'failed' => $failed, 'skipped' => $skipped];
         }
 
         // Fail fast if the account or token is unusable, so the operator gets
         // one clear reason instead of the same failure repeated per record.
         $this->listZones();
 
-        // Write the chain before the anchor, so the anchor never points at a
-        // record that does not exist yet.
-        $ordered = array_values($records);
-        $anchorIndex = null;
-        foreach ($ordered as $i => $rec) {
-            if (strcasecmp($rec['name'], $domain) === 0) {
-                $anchorIndex = $i;
-                break;
-            }
-        }
-        if ($anchorIndex !== null) {
-            $anchor = $ordered[$anchorIndex];
-            unset($ordered[$anchorIndex]);
-            $ordered = array_values($ordered);
-            $ordered[] = $anchor;
-        }
-
-        foreach ($ordered as $rec) {
+        foreach ($records as $rec) {
             $name = $rec['name'];
             $value = $rec['content'];
+
+            // Never touch the apex anchor; see the method comment.
+            if (strcasecmp($name, $domain) === 0) {
+                $skipped[] = [
+                    'name'   => $name,
+                    'reason' => 'apex anchor — point this at the chain yourself',
+                ];
+                continue;
+            }
 
             try {
                 $zoneId  = $this->resolveZoneId($name);
@@ -291,7 +288,7 @@ class CloudflareAPI {
             }
         }
 
-        return ['updated' => $updated, 'failed' => $failed];
+        return ['updated' => $updated, 'failed' => $failed, 'skipped' => $skipped];
     }
 
     /**
