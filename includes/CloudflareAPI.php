@@ -135,7 +135,7 @@ class CloudflareAPI {
      * Resolve the zone that owns a record name.
      *
      * Cloudflare's /zones?name= filter matches a zone name EXACTLY, so asking
-     * it for "spf0.domain.to.flatten.cloudflare.destination.com" finds nothing.
+     * it for "spf0.flattenme.com.cloudflarezone.com" finds nothing.
      * The owning zone is the longest zone name that is a suffix of the record
      * name, which is what this finds.
      */

@@ -563,19 +563,19 @@ $csrf          = generateCSRFToken();
 
         <div class="form-group">
           <label class="form-label" for="import_domain">Domain <span class="req">*</span></label>
-          <input class="form-input" type="text" id="import_domain" placeholder="domain.to.flatten.com"
+          <input class="form-input" type="text" id="import_domain" placeholder="flattenme.com"
                  autocomplete="off" spellcheck="false">
           <div class="form-hint">The sending domain whose SPF record you want to flatten.</div>
         </div>
         <div class="form-group">
           <label class="form-label" for="import_zone">Cloudflare Zone <span class="muted">(optional but recommended)</span></label>
-          <input class="form-input" type="text" id="import_zone" placeholder="cloudflare.destination.com"
+          <input class="form-input" type="text" id="import_zone" placeholder="cloudflarezone.com"
                  autocomplete="off" spellcheck="false">
           <div class="form-hint">
-            Records are created under this zone. Flattening <span class="inline-code">domain.to.flatten.com</span>
-            into <span class="inline-code">cloudflare.destination.com</span> produces
-            <span class="inline-code">spf0.domain.to.flatten.cloudflare.destination.com</span>,
-            <span class="inline-code">spf1.domain.to.flatten.cloudflare.destination.com</span>…
+            Records are created under this zone. Flattening <span class="inline-code">flattenme.com</span>
+            into <span class="inline-code">cloudflarezone.com</span> produces
+            <span class="inline-code">spf0.flattenme.com.cloudflarezone.com</span>,
+            <span class="inline-code">spf1.flattenme.com.cloudflarezone.com</span>…
             Leave blank to name them under the sending domain instead.
           </div>
         </div>
@@ -602,11 +602,11 @@ $csrf          = generateCSRFToken();
           <input type="hidden" name="action" value="add_domain">
           <div class="form-group">
             <label class="form-label" for="domain">Domain <span class="req">*</span></label>
-            <input class="form-input" type="text" id="domain" name="domain" placeholder="domain.to.flatten.com" required>
+            <input class="form-input" type="text" id="domain" name="domain" placeholder="flattenme.com" required>
           </div>
           <div class="form-group">
             <label class="form-label" for="zone">Cloudflare Zone</label>
-            <input class="form-input" type="text" id="zone" name="cloudflare_zone_name" placeholder="cloudflare.destination.com">
+            <input class="form-input" type="text" id="zone" name="cloudflare_zone_name" placeholder="cloudflarezone.com">
             <div class="form-hint">
               Chain records are created as <span class="inline-code">spf0.&lt;domain&gt;.&lt;zone&gt;</span>.
               Leave blank to use the sending domain.
