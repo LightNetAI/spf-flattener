@@ -536,8 +536,9 @@ class SPFFlattener {
         $spfTokens = $collapsed['spf'];
 
         // Where the chain lives. With a Cloudflare zone configured, records
-        // are created under that zone: flattening sandalford.com into the
-        // uid0.au zone yields spf0.sandalford.uid0.au and so on.
+        // are created under that zone: flattening domain.to.flatten.com into
+        // the cloudflare.destination.com zone yields
+        // spf0.domain.to.flatten.cloudflare.destination.com and so on.
         $base = $sendingDomain;
         if ($zone !== null && $zone !== '') {
             $base = $sendingDomain . '.' . $zone;

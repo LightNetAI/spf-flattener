@@ -226,8 +226,9 @@ Scheduled runs are attributed to `system@cron`.
    - `a:` / `mx:` → resolve A/AAAA or MX hosts
    - no SPF record on the include target → fall back to its A/AAAA records
 3. Deduplicate and order (IPv4 first)
-4. Pack into 255-character TXT records; if more than one chunk is needed,
-   publish `spf0.<domain>`, `spf1.<domain>`… and chain them from the root
+4. Pack into records strictly under 254 characters; if more than one chunk is
+   needed, create `spf0.<domain>.<zone>`, `spf1.<domain>.<zone>`… and chain
+   them from the apex anchor
 5. Store the record and individual addresses
 
 `ptr:` and `exists:` cannot be flattened to a static list and are ignored.
