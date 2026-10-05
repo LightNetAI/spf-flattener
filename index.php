@@ -294,7 +294,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         }
 
-        $allowed = ['cloudflare_api_token',
+        $allowed = ['cloudflare_api_token', 'cloudflare_default_zone',
                     'smtp_server', 'smtp_port', 'smtp_from_email', 'smtp_from_name',
                     'smtp_username', 'smtp_password', 'enable_email_notifications'];
 
@@ -321,6 +321,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                   . 'you copied the whole token and not an API key.',
                     'error'
                 );
+                header('Location: index.php#config');
+                exit;
+            }
+            if ($key === 'cloudflare_default_zone' && $value !== '' && !isValidDomain($value)) {
+                setFlash('That Cloudflare zone is not a valid domain name.', 'error');
                 header('Location: index.php#config');
                 exit;
             }
@@ -372,6 +377,13 @@ $config = [];
 foreach ($db->query("SELECT config_key, config_value FROM config")->fetchAll() as $c) {
     $config[$c['config_key']] = $c['config_value'];
 }
+
+// Pre-set Cloudflare zone from Settings, used to pre-fill the zone boxes so it
+// does not have to be retyped for every domain.
+$defaultZone = trim((string) ($config['cloudflare_default_zone'] ?? ''));
+
+// Also exposed to renderScripts() so the zone box can be refilled client-side.
+$GLOBALS['spfDefaultZone'] = $defaultZone;
 
 $totalIps      = array_sum(array_column($domains, 'ip_count'));
 $overLimit     = count(array_filter($domains, fn($d) => $d['lookup_count_before'] > MAX_DNS_LOOKUPS));
@@ -568,9 +580,10 @@ $csrf          = generateCSRFToken();
           <div class="form-hint">The sending domain whose SPF record you want to flatten.</div>
         </div>
         <div class="form-group">
-          <label class="form-label" for="import_zone">Cloudflare Zone <span class="muted">(optional but recommended)</span></label>
+          <label class="form-label" for="import_zone">Cloudflare Zone</label>
           <input class="form-input" type="text" id="import_zone" placeholder="cloudflarezone.com"
-                 autocomplete="off" spellcheck="false">
+                 autocomplete="off" spellcheck="false"
+                 value="<?= htmlspecialchars($defaultZone) ?>">
           <div class="form-hint">
             Records are created under this zone. Flattening <span class="inline-code">flattenme.com</span>
             into <span class="inline-code">cloudflarezone.com</span> produces
@@ -606,7 +619,8 @@ $csrf          = generateCSRFToken();
           </div>
           <div class="form-group">
             <label class="form-label" for="zone">Cloudflare Zone</label>
-            <input class="form-input" type="text" id="zone" name="cloudflare_zone_name" placeholder="cloudflarezone.com">
+            <input class="form-input" type="text" id="zone" name="cloudflare_zone_name"
+                   placeholder="cloudflarezone.com" value="<?= htmlspecialchars($defaultZone) ?>">
             <div class="form-hint">
               Chain records are created as <span class="inline-code">spf0.&lt;domain&gt;.&lt;zone&gt;</span>.
               Leave blank to use the sending domain.
@@ -755,6 +769,20 @@ $csrf          = generateCSRFToken();
             <div class="form-hint">
               A global API key is deliberately not supported: it grants access to
               every zone in the account, far more than this tool needs.
+            </div>
+          </div>
+          <?php /* Pre-set zone, used to pre-fill the Cloudflare Zone box on Add Domain. */ ?>
+          <div class="form-group">
+            <label class="form-label" for="cf_zone">Default Cloudflare Zone</label>
+            <input class="form-input" type="text" id="cf_zone" name="cloudflare_default_zone"
+                   autocomplete="off" spellcheck="false"
+                   placeholder="cloudflarezone.com"
+                   value="<?= htmlspecialchars($config['cloudflare_default_zone'] ?? '') ?>">
+            <div class="form-hint">
+              Pre-fills the Cloudflare Zone box when you add a domain, so you
+              don't have to retype it. Records are created under this zone as
+              <span class="inline-code">spf0.&lt;domain&gt;.&lt;zone&gt;</span>.
+              Leave blank to have the box start empty.
             </div>
           </div>
           <button class="btn btn-primary" type="submit">Save Cloudflare Settings</button>

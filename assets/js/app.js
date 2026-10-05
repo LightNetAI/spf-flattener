@@ -159,8 +159,38 @@
 
   window.activateTabFromHash = activateTabFromHash;
 
-  document.addEventListener('DOMContentLoaded', activateTabFromHash);
-  window.addEventListener('hashchange', activateTabFromHash);
+  /* ---- Add Domain prefill ---------------------------------- */
+  /**
+   * Repopulate the Cloudflare Zone boxes from the zone pre-set in Settings.
+   *
+   * The server already renders them prefilled. This refills them on demand so
+   * that arriving at Add Domain after clearing a box gives a usable value
+   * again, which is what "click Add Domain and it populates" means in practice.
+   */
+  function prefillZones() {
+    var preset = (window.SPF_DEFAULT_ZONE || '').trim();
+    if (!preset) return;
+
+    ['import_zone', 'zone'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el && !el.value.trim()) {
+        el.value = preset;
+      }
+    });
+  }
+
+  window.prefillZones = prefillZones;
+
+  document.addEventListener('DOMContentLoaded', function () {
+    prefillZones();
+    activateTabFromHash();
+  });
+  window.addEventListener('hashchange', function () {
+    if ((window.location.hash || '').replace(/^#/, '').toLowerCase() === 'add') {
+      prefillZones();
+    }
+    activateTabFromHash();
+  });
 
   /* ---- Collapsibles ---------------------------------------- */
   /**

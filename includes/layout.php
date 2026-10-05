@@ -178,7 +178,15 @@ function renderHead($title) {
  */
 function renderScripts() {
     $js = 'assets/js/app.js';
+
+    // Expose the pre-set Cloudflare zone so Add Domain can prefill the zone
+    // box client-side. Read from the config the page has already loaded when
+    // available, so no extra query is needed.
+    $defaultZone = isset($GLOBALS['spfDefaultZone'])
+        ? (string) $GLOBALS['spfDefaultZone']
+        : '';
     ?>
+    <script>window.SPF_DEFAULT_ZONE = <?= json_encode($defaultZone) ?>;</script>
     <script src="<?= htmlspecialchars($js . '?v=' . assetVersion($js)) ?>"></script>
     <?php
 }
