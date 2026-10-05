@@ -6,8 +6,10 @@
  */
 
 class CloudflareAPI {
-    private $apiEmail;
-    private $apiKey;
+    // Authentication is by scoped API token only. The legacy email + global
+    // API key path has been removed: a global key grants access to every zone
+    // in the account, so a leaked or over-scoped key risks far more than the
+    // token needed for this job.
     private $apiToken;
     // Cached zone list for the current request; see listZones().
     private $zoneCache = null;
@@ -15,28 +17,21 @@ class CloudflareAPI {
     // API returns {"code":10404,"message":"No route for that URI"}, which
     // surfaced as CLOUDFLARE_ZONE_LOOKUP_FAILED for every call.
     private $baseUrl = 'https://api.cloudflare.com/client/v4';
-    
+
     public function __construct() {
-        // Try to get from config first, then database
-        $this->apiEmail = CLOUDFLARE_API_EMAIL ?: $this->getConfig('cloudflare_api_email');
-        $this->apiKey = CLOUDFLARE_API_KEY ?: $this->getConfig('cloudflare_api_key');
         $this->apiToken = defined('CLOUDFLARE_API_TOKEN') && CLOUDFLARE_API_TOKEN
             ? CLOUDFLARE_API_TOKEN
             : $this->getConfig('cloudflare_api_token');
     }
 
     /**
-     * Are credentials configured at all?
+     * Is an API token configured?
      *
-     * An API token is sufficient on its own; otherwise an email and key pair is
-     * required. Checking first turns an opaque 403 from Cloudflare into an
-     * actionable message.
+     * Checking first turns an opaque 403 from Cloudflare into an actionable
+     * message.
      */
     public function hasCredentials() {
-        if (!empty($this->apiToken)) {
-            return true;
-        }
-        return !empty($this->apiEmail) && !empty($this->apiKey);
+        return !empty($this->apiToken);
     }
     
     /**
@@ -51,8 +46,9 @@ class CloudflareAPI {
     protected function request($method, $endpoint, $data = null) {
         if (!$this->hasCredentials()) {
             throw new Exception(
-                'No Cloudflare credentials are configured. Add an API token, or an '
-              . 'email and global API key, under Settings before importing a zone.'
+                'No Cloudflare API token is configured. Add one under Settings: '
+              . 'create a token with Zone:Read and DNS:Edit for the zones you '
+              . 'flatten, then paste it into the API Token field.'
             );
         }
 
@@ -65,19 +61,12 @@ class CloudflareAPI {
         curl_setopt($ch, CURLOPT_TIMEOUT, 20);
         curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
 
-        // A scoped API token is preferred; fall back to the legacy email + key.
-        if (!empty($this->apiToken)) {
-            $headers = [
-                'Authorization: Bearer ' . $this->apiToken,
-                'Content-Type: application/json',
-            ];
-        } else {
-            $headers = [
-                'X-Auth-Email: ' . $this->apiEmail,
-                'X-Auth-Key: ' . $this->apiKey,
-                'Content-Type: application/json',
-            ];
-        }
+        // API token authentication. The email + global key path was removed
+        // deliberately — see the class comment.
+        $headers = [
+            'Authorization: *** ' . $this->apiToken,
+            'Content-Type: application/json',
+        ];
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         
         if ($data !== null) {

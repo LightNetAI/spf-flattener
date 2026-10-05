@@ -80,12 +80,12 @@ $output = shell_exec("dig +short TXT {$sanitizedDomain} 2>/dev/null");
 **Current State:**
 - Domain names: Checked with `!empty()` and `trim()`
 - Email addresses: No validation
-- API keys: No validation
+- Cloudflare credentials: Format check via `isValidCloudflareApiToken()`; API tokens only, global API keys are unsupported
 
 **Recommendations:**
 1. Use `isValidDomain()` from Security.php for all domain inputs
 2. Use `isValidEmail()` for email configuration
-3. Use `isValidCloudflareApiKey()` for API key validation
+3. Use `isValidCloudflareApiToken()` for API token format validation
 4. Add maximum length validation for all string inputs
 
 **Priority:** LOW - Current validation provides basic protection, enhancements are defense-in-depth.

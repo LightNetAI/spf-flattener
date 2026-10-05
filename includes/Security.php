@@ -85,14 +85,18 @@ function sanitizeInt($input, $default = 0) {
 }
 
 /**
- * Validate Cloudflare API key format
- * 
- * @param string $key API key to validate
- * @return bool True if valid format
+ * Validate a Cloudflare API token's format.
+ *
+ * Tokens are 40 characters of [A-Za-z0-9_-]. This is a format check only — it
+ * cannot tell whether the token is valid, scoped correctly, or still active.
+ * Cloudflare remains the authority on that.
+ *
+ * @param string $token Token to validate
+ * @return bool True if the format looks right
  */
-function isValidCloudflareApiKey($key) {
-    // Cloudflare API keys are typically 37 characters
-    return is_string($key) && strlen($key) >= 30 && preg_match('/^[a-zA-Z0-9_-]+$/', $key);
+function isValidCloudflareApiToken($token) {
+    return is_string($token)
+        && preg_match('/^[A-Za-z0-9_-]{40}$/', $token) === 1;
 }
 
 /**

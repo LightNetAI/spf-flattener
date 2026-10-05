@@ -696,6 +696,6 @@ function showHelp() {
     echo "  php cli.php import --domain=example.com\n";
     echo "  php cli.php import --domain=newdomain.com --add\n";
     echo "  php cli.php dns-test --domain=google.com\n";
-    echo "  php cli.php config --set cloudflare_api_email=user@example.com\n\n";
+    echo "  php cli.php config --set cloudflare_api_token=your-token-here\n\n";
     echo str_repeat('=', 50) . "\n";
 }

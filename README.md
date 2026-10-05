@@ -259,6 +259,16 @@ define('AUTO_UPDATE_ENABLED', true); // publish to Cloudflare automatically
 Cloudflare credentials and SMTP settings are managed in the web UI under
 **Settings** (admin only) and stored in the `config` table.
 
+Publishing authenticates with a **scoped API token** only. Create one at
+`dash.cloudflare.com → My Profile → API Tokens` with `Zone:Read` and
+`DNS:Edit` for the zones you flatten. Global API keys are deliberately not
+supported — a global key grants access to every zone in the account, far more
+than this tool needs. Enter it under **Settings → Cloudflare → API Token**, or:
+
+```bash
+php cli.php config --set cloudflare_api_token=your-token-here
+```
+
 ---
 
 ## Scheduled runs

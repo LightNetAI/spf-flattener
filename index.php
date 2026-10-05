@@ -283,7 +283,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         }
 
-        $allowed = ['cloudflare_api_email', 'cloudflare_api_key', 'cloudflare_api_token',
+        $allowed = ['cloudflare_api_token',
                     'smtp_server', 'smtp_port', 'smtp_from_email', 'smtp_from_name',
                     'smtp_username', 'smtp_password', 'enable_email_notifications'];
 
@@ -295,7 +295,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $value = trim((string) $_POST[$key]);
 
             // Skip blank secrets so they aren't wiped by an empty submit.
-            if (in_array($key, ['cloudflare_api_key', 'cloudflare_api_token', 'smtp_password'], true) && $value === '') {
+            if (in_array($key, ['cloudflare_api_token', 'smtp_password'], true) && $value === '') {
                 continue;
             }
             if ($key === 'smtp_from_email' && $value !== '' && !isValidEmail($value)) {
@@ -303,8 +303,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 header('Location: index.php#config');
                 exit;
             }
-            if ($key === 'cloudflare_api_email' && $value !== '' && !isValidEmail($value)) {
-                setFlash('That Cloudflare email address is not valid.', 'error');
+            if ($key === 'cloudflare_api_token' && $value !== '' && !isValidCloudflareApiToken($value)) {
+                setFlash(
+                    'That does not look like a Cloudflare API token. Tokens are 40 '
+                  . 'characters of letters, numbers, dash and underscore. Make sure '
+                  . 'you copied the whole token and not an API key.',
+                    'error'
+                );
                 header('Location: index.php#config');
                 exit;
             }
@@ -724,24 +729,20 @@ $csrf          = generateCSRFToken();
           <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf) ?>">
           <input type="hidden" name="action" value="save_config">
           <div class="form-group">
-            <label class="form-label" for="cf_email">API Email <span class="muted">(legacy key auth)</span></label>
-            <input class="form-input" type="email" id="cf_email" name="cloudflare_api_email"
-                   value="<?= htmlspecialchars($config['cloudflare_api_email'] ?? '') ?>">
-          </div>
-          <div class="form-group">
-            <label class="form-label" for="cf_key">Global API Key</label>
-            <input class="form-input" type="password" id="cf_key" name="cloudflare_api_key"
-                   placeholder="<?= !empty($config['cloudflare_api_key']) ? '•••••••• (unchanged)' : 'Not set' ?>">
-            <div class="form-hint">Leave blank to keep the current key.</div>
-          </div>
-          <div class="form-group">
-            <label class="form-label" for="cf_token">API Token <span class="muted">(preferred)</span></label>
+            <label class="form-label" for="cf_token">API Token <span class="req">*</span></label>
             <input class="form-input" type="password" id="cf_token" name="cloudflare_api_token"
-                   placeholder="<?= !empty($config['cloudflare_api_token']) ? '•••••••• (unchanged)' : 'Not set' ?>">
+                   autocomplete="off" spellcheck="false"
+                   placeholder="<?= !empty($config['cloudflare_api_token']) ? '•••••••• (unchanged)' : 'Paste your API token' ?>">
             <div class="form-hint">
-              A scoped token needs <span class="inline-code">Zone:Read</span> and
-              <span class="inline-code">DNS:Edit</span> for the zones you flatten.
-              When set, this is used instead of the email and key.
+              Create a token at
+              <span class="inline-code">dash.cloudflare.com → My Profile → API Tokens</span>
+              with <span class="inline-code">Zone:Read</span> and
+              <span class="inline-code">DNS:Edit</span> permissions for the zones you
+              flatten. Leave blank to keep the current token.
+            </div>
+            <div class="form-hint">
+              A global API key is deliberately not supported: it grants access to
+              every zone in the account, far more than this tool needs.
             </div>
           </div>
           <button class="btn btn-primary" type="submit">Save Cloudflare Settings</button>

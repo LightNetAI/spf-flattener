@@ -31,8 +31,11 @@ defined('APP_VERSION') || define('APP_VERSION', '1.0.0');
 defined('APP_URL')     || define('APP_URL', 'http://localhost/spf-flattener');
 
 // Cloudflare API settings (may also be stored in the database)
-defined('CLOUDFLARE_API_EMAIL') || define('CLOUDFLARE_API_EMAIL', '');
-defined('CLOUDFLARE_API_KEY')   || define('CLOUDFLARE_API_KEY', '');
+// Cloudflare publishing authenticates with a scoped API token only. The legacy
+// email + global API key pair is intentionally unsupported: a global key
+// grants access to every zone in the account, which is far broader than the
+// DNS:Edit permission this tool needs.
+defined('CLOUDFLARE_API_TOKEN') || define('CLOUDFLARE_API_TOKEN', '');
 
 // Email settings
 defined('SMTP_SERVER')     || define('SMTP_SERVER', '');

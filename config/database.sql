@@ -59,8 +59,7 @@ CREATE TABLE IF NOT EXISTS config (
 
 -- Insert default config values
 INSERT INTO config (config_key, config_value) VALUES
-    ('cloudflare_api_email', ''),
-    ('cloudflare_api_key', ''),
+    ('cloudflare_api_token', ''),
     ('smtp_server', ''),
     ('smtp_port', '587'),
     ('smtp_from_email', ''),
