@@ -9,6 +9,8 @@ class CloudflareAPI {
     private $apiEmail;
     private $apiKey;
     private $apiToken;
+    // Cached zone list for the current request; see listZones().
+    private $zoneCache = null;
     // Cloudflare's API lives under /client/v4. Without the /client segment the
     // API returns {"code":10404,"message":"No route for that URI"}, which
     // surfaced as CLOUDFLARE_ZONE_LOOKUP_FAILED for every call.
@@ -40,7 +42,13 @@ class CloudflareAPI {
     /**
      * Make API request to Cloudflare
      */
-    private function request($method, $endpoint, $data = null) {
+    /**
+     * Perform an API request.
+     *
+     * Protected so a test double can substitute canned responses without
+     * reaching the network.
+     */
+    protected function request($method, $endpoint, $data = null) {
         if (!$this->hasCredentials()) {
             throw new Exception(
                 'No Cloudflare credentials are configured. Add an API token, or an '
@@ -108,14 +116,66 @@ class CloudflareAPI {
     /**
      * Get zone ID by domain name
      */
-    public function getZoneId($domain) {
-        $response = $this->request('GET', '/zones?name=' . urlencode($domain));
-        
-        if (!empty($response['result'])) {
-            return $response['result'][0]['id'];
+    /**
+     * Every zone this account can see, cached for the request.
+     *
+     * Zone lookups must be done once per request, not once per record: a chain
+     * of six records would otherwise spend six API calls resolving zones.
+     */
+    private function listZones() {
+        if ($this->zoneCache !== null) {
+            return $this->zoneCache;
         }
-        
-        throw new Exception("Zone not found for domain: {$domain}");
+
+        $zones = [];
+        $page = 1;
+        do {
+            $response = $this->request('GET', '/zones?per_page=50&page=' . $page);
+            foreach ($response['result'] as $zone) {
+                $zones[] = ['id' => $zone['id'], 'name' => $zone['name']];
+            }
+            $totalPages = $response['result_info']['total_pages'] ?? 1;
+            $page++;
+        } while ($page <= $totalPages && $page <= 20);
+
+        $this->zoneCache = $zones;
+        return $zones;
+    }
+
+    /**
+     * Resolve the zone that owns a record name.
+     *
+     * Cloudflare's /zones?name= filter matches a zone name EXACTLY, so asking
+     * it for "spf0.sandalford.com.uid0.au" finds nothing. The owning zone is
+     * the longest zone name that is a suffix of the record name, which is what
+     * this finds.
+     */
+    public function resolveZoneId($name) {
+        $name = strtolower(rtrim($name, '.'));
+        $best = null;
+
+        foreach ($this->listZones() as $zone) {
+            $zname = strtolower($zone['name']);
+            if ($name === $zname || str_ends_with($name, '.' . $zname)) {
+                if ($best === null || strlen($zname) > strlen($best['name'])) {
+                    $best = ['id' => $zone['id'], 'name' => $zname];
+                }
+            }
+        }
+
+        if ($best !== null) {
+            return $best['id'];
+        }
+
+        throw new Exception(
+            "No Cloudflare zone in this account matches '{$name}'. "
+          . "The zone may belong to a different account, or the API token may "
+          . "lack Zone:Read for it."
+        );
+    }
+
+    public function getZoneId($domain) {
+        return $this->resolveZoneId($domain);
     }
     
     /**
@@ -143,12 +203,19 @@ class CloudflareAPI {
     /**
      * Update SPF record in Cloudflare
      */
-    public function updateSPFRecord($zoneId, $recordId, $spfContent, $proxied = false) {
+    public function updateSPFRecord($zoneId, $recordId, $spfContent, $proxied = false, $name = null, $ttl = 1) {
+        // A PUT replaces the whole record. Sending only content and proxied
+        // would blank the name and TTL, so the full record is sent every time.
         $data = [
+            'type' => 'TXT',
             'content' => '"' . $spfContent . '"',
-            'proxied' => $proxied
+            'proxied' => $proxied,
+            'ttl' => $ttl,
         ];
-        
+        if ($name !== null) {
+            $data['name'] = $name;
+        }
+
         $response = $this->request('PUT', "/zones/{$zoneId}/dns_records/{$recordId}", $data);
         return $response['result'];
     }
@@ -191,6 +258,10 @@ class CloudflareAPI {
             return ['updated' => $updated, 'failed' => $failed];
         }
 
+        // Fail fast if the account or token is unusable, so the operator gets
+        // one clear reason instead of the same failure repeated per record.
+        $this->listZones();
+
         // Write the chain before the anchor, so the anchor never points at a
         // record that does not exist yet.
         $ordered = array_values($records);
@@ -213,11 +284,14 @@ class CloudflareAPI {
             $value = $rec['content'];
 
             try {
-                $zoneId  = $this->getZoneId($name);
+                $zoneId  = $this->resolveZoneId($name);
                 $existing = $this->getTxtRecord($zoneId, $name);
 
                 if ($existing) {
-                    $this->updateSPFRecord($zoneId, $existing['id'], $value, $existing['proxied']);
+                    $this->updateSPFRecord(
+                        $zoneId, $existing['id'], $value,
+                        $existing['proxied'], $name, $existing['ttl']
+                    );
                 } else {
                     $this->createSPFRecord($zoneId, $name, $value);
                 }
@@ -251,6 +325,8 @@ class CloudflareAPI {
                     'id'      => $record['id'],
                     'content' => $content,
                     'proxied' => $record['proxied'] ?? false,
+                    'ttl'     => $record['ttl'] ?? 1,
+                    'name'    => $record['name'] ?? null,
                 ];
             }
         }

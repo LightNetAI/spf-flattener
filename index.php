@@ -240,9 +240,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 if (!empty($outcome['failed'])) {
-                    $names = implode(', ', array_column($outcome['failed'], 'name'));
-                    $auth->auditCurrent('CLOUDFLARE_PUSH_FAILED', "Failed: {$names}", $name);
-                    setFlash($msg . " Failed to publish: {$names}.", 'warning');
+                    // Group by reason so six records failing for one cause read
+                    // as one problem, not six.
+                    $byReason = [];
+                    foreach ($outcome['failed'] as $f) {
+                        $byReason[$f['error']][] = $f['name'];
+                    }
+                    $lines = [];
+                    foreach ($byReason as $error => $names) {
+                        $lines[] = implode(', ', $names) . ' — ' . $error;
+                    }
+                    $detail = implode(' | ', $lines);
+
+                    error_log('Cloudflare publish failed: ' . $detail);
+                    $auth->auditCurrent('CLOUDFLARE_PUSH_FAILED', $detail, $name);
+
+                    $summary = count($outcome['failed']) . ' record(s) could not be published';
+                    $first = array_key_first($byReason);
+                    setFlash($msg . " {$summary}: {$first}", 'warning');
                     header('Location: index.php');
                     exit;
                 }
