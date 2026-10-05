@@ -268,8 +268,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         }
 
-        $allowed = ['cloudflare_api_email', 'cloudflare_api_key', 'smtp_server',
-                    'smtp_port', 'smtp_from_email', 'smtp_from_name',
+        $allowed = ['cloudflare_api_email', 'cloudflare_api_key', 'cloudflare_api_token',
+                    'smtp_server', 'smtp_port', 'smtp_from_email', 'smtp_from_name',
                     'smtp_username', 'smtp_password', 'enable_email_notifications'];
 
         $saved = 0;
@@ -280,7 +280,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $value = trim((string) $_POST[$key]);
 
             // Skip blank secrets so they aren't wiped by an empty submit.
-            if (in_array($key, ['cloudflare_api_key', 'smtp_password'], true) && $value === '') {
+            if (in_array($key, ['cloudflare_api_key', 'cloudflare_api_token', 'smtp_password'], true) && $value === '') {
                 continue;
             }
             if ($key === 'smtp_from_email' && $value !== '' && !isValidEmail($value)) {
@@ -709,15 +709,25 @@ $csrf          = generateCSRFToken();
           <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf) ?>">
           <input type="hidden" name="action" value="save_config">
           <div class="form-group">
-            <label class="form-label" for="cf_email">API Email</label>
+            <label class="form-label" for="cf_email">API Email <span class="muted">(legacy key auth)</span></label>
             <input class="form-input" type="email" id="cf_email" name="cloudflare_api_email"
                    value="<?= htmlspecialchars($config['cloudflare_api_email'] ?? '') ?>">
           </div>
           <div class="form-group">
-            <label class="form-label" for="cf_key">API Key</label>
+            <label class="form-label" for="cf_key">Global API Key</label>
             <input class="form-input" type="password" id="cf_key" name="cloudflare_api_key"
                    placeholder="<?= !empty($config['cloudflare_api_key']) ? '•••••••• (unchanged)' : 'Not set' ?>">
             <div class="form-hint">Leave blank to keep the current key.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="cf_token">API Token <span class="muted">(preferred)</span></label>
+            <input class="form-input" type="password" id="cf_token" name="cloudflare_api_token"
+                   placeholder="<?= !empty($config['cloudflare_api_token']) ? '•••••••• (unchanged)' : 'Not set' ?>">
+            <div class="form-hint">
+              A scoped token needs <span class="inline-code">Zone:Read</span> and
+              <span class="inline-code">DNS:Edit</span> for the zones you flatten.
+              When set, this is used instead of the email and key.
+            </div>
           </div>
           <button class="btn btn-primary" type="submit">Save Cloudflare Settings</button>
         </form>

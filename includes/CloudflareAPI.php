@@ -8,29 +8,69 @@
 class CloudflareAPI {
     private $apiEmail;
     private $apiKey;
-    private $baseUrl = 'https://api.cloudflare.com/v4';
+    private $apiToken;
+    // Cloudflare's API lives under /client/v4. Without the /client segment the
+    // API returns {"code":10404,"message":"No route for that URI"}, which
+    // surfaced as CLOUDFLARE_ZONE_LOOKUP_FAILED for every call.
+    private $baseUrl = 'https://api.cloudflare.com/client/v4';
     
     public function __construct() {
         // Try to get from config first, then database
         $this->apiEmail = CLOUDFLARE_API_EMAIL ?: $this->getConfig('cloudflare_api_email');
         $this->apiKey = CLOUDFLARE_API_KEY ?: $this->getConfig('cloudflare_api_key');
+        $this->apiToken = defined('CLOUDFLARE_API_TOKEN') && CLOUDFLARE_API_TOKEN
+            ? CLOUDFLARE_API_TOKEN
+            : $this->getConfig('cloudflare_api_token');
+    }
+
+    /**
+     * Are credentials configured at all?
+     *
+     * An API token is sufficient on its own; otherwise an email and key pair is
+     * required. Checking first turns an opaque 403 from Cloudflare into an
+     * actionable message.
+     */
+    public function hasCredentials() {
+        if (!empty($this->apiToken)) {
+            return true;
+        }
+        return !empty($this->apiEmail) && !empty($this->apiKey);
     }
     
     /**
      * Make API request to Cloudflare
      */
     private function request($method, $endpoint, $data = null) {
+        if (!$this->hasCredentials()) {
+            throw new Exception(
+                'No Cloudflare credentials are configured. Add an API token, or an '
+              . 'email and global API key, under Settings before importing a zone.'
+            );
+        }
+
         $url = $this->baseUrl . $endpoint;
         
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'X-Auth-Email: ' . $this->apiEmail,
-            'X-Auth-Key: ' . $this->apiKey,
-            'Content-Type: application/json'
-        ]);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+
+        // A scoped API token is preferred; fall back to the legacy email + key.
+        if (!empty($this->apiToken)) {
+            $headers = [
+                'Authorization: Bearer ' . $this->apiToken,
+                'Content-Type: application/json',
+            ];
+        } else {
+            $headers = [
+                'X-Auth-Email: ' . $this->apiEmail,
+                'X-Auth-Key: ' . $this->apiKey,
+                'Content-Type: application/json',
+            ];
+        }
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         
         if ($data !== null) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
@@ -44,13 +84,22 @@ class CloudflareAPI {
         unset($ch);
         
         if ($error) {
-            throw new Exception("Cloudflare API error: " . $error);
+            throw new Exception("Could not reach the Cloudflare API: " . $error);
         }
-        
+
         $result = json_decode($response, true);
-        
+
         if (!is_array($result) || empty($result['success'])) {
-            throw new Exception("Cloudflare API error: " . ($result['errors'][0]['message'] ?? 'Unknown error'));
+            // Surface the API's own code and message; a bare "Unknown error"
+            // made a misconfigured URL look like an authentication problem.
+            $msg  = $result['errors'][0]['message'] ?? null;
+            $code = $result['errors'][0]['code'] ?? null;
+            if ($msg === null) {
+                $msg = 'HTTP ' . $httpCode . ' with an unparseable response';
+            } elseif ($code !== null) {
+                $msg = "{$msg} (code {$code})";
+            }
+            throw new Exception("Cloudflare API error: {$msg}");
         }
         
         return $result;
