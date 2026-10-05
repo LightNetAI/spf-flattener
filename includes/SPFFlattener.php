@@ -551,9 +551,12 @@ class SPFFlattener {
             ];
         }
 
-        // Pack into records that stay within the character limit.
-        $limit  = defined('SPF_CHAR_LIMIT') ? SPF_CHAR_LIMIT : 255;
-        $blocks = $this->fitRecords($spfTokens, $base, $limit);
+        // Pack into records that stay within the character limit. The bound is
+        // exclusive: no record may reach SPF_CHAR_LIMIT characters.
+        $maxLen = defined('SPF_MAX_RECORD_LEN')
+            ? SPF_MAX_RECORD_LEN
+            : ((defined('SPF_CHAR_LIMIT') ? SPF_CHAR_LIMIT : 254) - 1);
+        $blocks = $this->fitRecords($spfTokens, $base, $maxLen);
 
         $records = [];
         $lastIndex = count($blocks) - 1;
@@ -585,13 +588,12 @@ class SPFFlattener {
         // The root record is the anchor's target — the first link in the chain.
         $root = $anchor;
 
-        // Every record should fit a single DNS character-string so it can be
-        // pasted straight into a provider's form. Anything longer has to be
-        // published as several quoted strings instead.
+        // Every record must be strictly shorter than the limit. Anything at or
+        // over it has to be published as several quoted strings instead.
         foreach ($records as $rec) {
-            if (strlen($rec['content']) > $limit) {
+            if (strlen($rec['content']) >= $maxLen) {
                 $warnings[] = "Record {$rec['name']} is " . strlen($rec['content'])
-                            . " characters, over the {$limit}-character limit; "
+                            . " characters, not under the {$maxLen}-character limit; "
                             . 'publish it as multiple quoted strings (BIND format).';
                 break;
             }

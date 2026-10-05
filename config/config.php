@@ -52,9 +52,14 @@ defined('DNS_CACHE_TTL')   || define('DNS_CACHE_TTL', 3600); // seconds
 // driven by SPF_CHAR_LIMIT below, matching the 255-character DNS limit.
 defined('SPF_RECORD_BYTES') || define('SPF_RECORD_BYTES', 450);
 
-// Maximum characters in a single generated record. Records are packed to this
-// so each one fits a DNS character-string and pastes cleanly into a provider.
+// A generated record must be STRICTLY SHORTER than this many characters.
+// 254 is the exclusive bound, so the longest record written is 253. Expressed
+// this way because the requirement is stated as "less than 254"; changing this
+// value changes the threshold directly.
 defined('SPF_CHAR_LIMIT') || define('SPF_CHAR_LIMIT', 254);
+
+// The longest a generated record may actually be, derived from the bound above.
+defined('SPF_MAX_RECORD_LEN') || define('SPF_MAX_RECORD_LEN', SPF_CHAR_LIMIT - 1);
 
 // Logging
 defined('LOG_FILE')  || define('LOG_FILE', __DIR__ . '/../logs/spf-flattener.log');
