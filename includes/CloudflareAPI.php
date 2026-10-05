@@ -64,7 +64,7 @@ class CloudflareAPI {
         // API token authentication. The email + global key path was removed
         // deliberately — see the class comment.
         $headers = [
-            'Authorization: *** ' . $this->apiToken,
+            'Authorization: Bearer ' . $this->apiToken,
             'Content-Type: application/json',
         ];
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
