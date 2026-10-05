@@ -544,8 +544,9 @@ class SPFFlattener {
         }
 
         if (empty($spfTokens)) {
+            $anchor = "v=spf1 include:spf0.{$base} -all";
             return [
-                'root' => 'v=spf1 -all', 'records' => [],
+                'root' => $anchor, 'records' => [], 'anchor' => $anchor,
                 'lookups' => 0, 'tokens' => 0, 'base' => $base,
             ];
         }
@@ -571,8 +572,18 @@ class SPFFlattener {
             ];
         }
 
-        // The root record is the first link in the chain.
-        $root = $records[0]['content'];
+        // The apex anchor points at the first record in the chain. It is stored
+        // first so it heads the set, and it is what the sending domain itself
+        // publishes: v=spf1 include:spf0.example.com.zone -all
+        $anchor = "v=spf1 include:spf0.{$base} -all";
+        array_unshift($records, [
+            'name'    => $sendingDomain,
+            'content' => $anchor,
+            'anchor'  => true,
+        ]);
+
+        // The root record is the anchor's target — the first link in the chain.
+        $root = $anchor;
 
         // Every record should fit a single DNS character-string so it can be
         // pasted straight into a provider's form. Anything longer has to be
@@ -592,6 +603,7 @@ class SPFFlattener {
             'lookups' => count($records),
             'tokens'  => count($spfTokens),
             'base'    => $base,
+            'anchor'  => $anchor,
         ];
     }
 

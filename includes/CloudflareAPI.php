@@ -123,13 +123,15 @@ class CloudflareAPI {
     /**
      * Publish a complete SPF record chain to Cloudflare.
      *
-     * spf0.<domain> references spf1.<domain> and so on, so every record must
-     * exist or SPF evaluation fails with a PermError. Sub-records are written
-     * first: that way the chain is already resolvable when the apex anchor is
-     * updated to point at it.
+     * spf0.<domain>.<zone> references spf1.<domain>.<zone> and so on, so every
+     * record must exist or SPF evaluation fails with a PermError.
      *
-     * @param string $domain  Sending domain (the chain's suffix)
-     * @param array  $records [['name' => 'spf0.example.com', 'content' => 'v=spf1 …'], …]
+     * The apex anchor (named for the sending domain itself) usually lives in a
+     * different zone from the spfN records, so the zone is resolved per record
+     * name rather than once for the whole set.
+     *
+     * @param string $domain  Sending domain (the anchor's name and chain suffix)
+     * @param array  $records [['name' => …, 'content' => …], …]
      * @return array{updated:array,failed:array}
      */
     public function publishChain($domain, array $records) {
@@ -140,13 +142,29 @@ class CloudflareAPI {
             return ['updated' => $updated, 'failed' => $failed];
         }
 
-        $zoneId = $this->getZoneId($domain);
+        // Write the chain before the anchor, so the anchor never points at a
+        // record that does not exist yet.
+        $ordered = array_values($records);
+        $anchorIndex = null;
+        foreach ($ordered as $i => $rec) {
+            if (strcasecmp($rec['name'], $domain) === 0) {
+                $anchorIndex = $i;
+                break;
+            }
+        }
+        if ($anchorIndex !== null) {
+            $anchor = $ordered[$anchorIndex];
+            unset($ordered[$anchorIndex]);
+            $ordered = array_values($ordered);
+            $ordered[] = $anchor;
+        }
 
-        foreach ($records as $rec) {
+        foreach ($ordered as $rec) {
             $name = $rec['name'];
             $value = $rec['content'];
 
             try {
+                $zoneId  = $this->getZoneId($name);
                 $existing = $this->getTxtRecord($zoneId, $name);
 
                 if ($existing) {
@@ -155,7 +173,7 @@ class CloudflareAPI {
                     $this->createSPFRecord($zoneId, $name, $value);
                 }
                 $updated[] = $name;
-            } catch (Exception $e) {
+            } catch (Throwable $e) {
                 error_log("Cloudflare push failed for {$name}: " . $e->getMessage());
                 $failed[] = ['name' => $name, 'error' => $e->getMessage()];
             }

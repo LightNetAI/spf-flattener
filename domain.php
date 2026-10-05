@@ -384,8 +384,10 @@ $csrf = generateCSRFToken();
             </div>
             <div class="card__sub">
               <?php if (count($chain) > 1): ?>
-                Each costs one DNS lookup. Create all of them, then point the apex at
-                <span class="inline-code">spf0.<?= htmlspecialchars($domain['domain']) ?></span>.
+                The <span class="inline-code">apex anchor</span> is what
+                <span class="inline-code"><?= htmlspecialchars($domain['domain']) ?></span> publishes;
+                it points at <span class="inline-code">spf0.<?= htmlspecialchars($base ?? $domain['domain']) ?></span>,
+                which chains onward until every network is covered.
               <?php else: ?>
                 Publish this at the apex, or point the apex anchor at
                 <span class="inline-code">spf0.<?= htmlspecialchars($domain['domain']) ?></span>.
@@ -416,10 +418,17 @@ $csrf = generateCSRFToken();
         <?php endif; ?>
 
         <?php foreach ($chain as $i => $rec): ?>
+          <?php
+          // The anchor is named for the sending domain; everything else is an
+          // spfN record under the zone.
+          $isAnchor = ($rec['record_name'] === $domain['domain']);
+          ?>
           <div class="collapsible" onclick="toggleCollapse(this)">
             <span>
               <span class="inline-code"><?= htmlspecialchars($rec['record_name']) ?></span>
-              <?php if (!empty($rec['is_last'])): ?>
+              <?php if ($isAnchor): ?>
+                <span class="badge badge-info">apex anchor</span>
+              <?php elseif (!empty($rec['is_last'])): ?>
                 <span class="badge badge-neutral">terminal</span>
               <?php endif; ?>
             </span>

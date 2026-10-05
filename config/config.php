@@ -54,7 +54,7 @@ defined('SPF_RECORD_BYTES') || define('SPF_RECORD_BYTES', 450);
 
 // Maximum characters in a single generated record. Records are packed to this
 // so each one fits a DNS character-string and pastes cleanly into a provider.
-defined('SPF_CHAR_LIMIT') || define('SPF_CHAR_LIMIT', 255);
+defined('SPF_CHAR_LIMIT') || define('SPF_CHAR_LIMIT', 254);
 
 // Logging
 defined('LOG_FILE')  || define('LOG_FILE', __DIR__ . '/../logs/spf-flattener.log');

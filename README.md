@@ -15,11 +15,15 @@ branded web GUI with username / password authentication.
   adjacent ranges are merged, so a few hundred addresses become a handful of
   networks (the same work `netaddr.IPSet.iter_cidrs()` does upstream)
 - Counts DNS lookups per RFC 7208 (10-lookup limit)
-- Splits the result across `spf0.<domain>`, `spf1.<domain>` … using the same
-  450-byte packing budget as upstream, chaining each record forward with
+- Splits the result across `spf0.<domain>.<zone>`, `spf1.<domain>.<zone>` …
+  packing each record to the 254-character DNS limit, chaining forward with
   `include:` and terminating every one with `-all`
+- **Generates the apex anchor** — `v=spf1 include:spf0.<domain>.<zone> -all` —
+  so the sending domain's own record is produced, not left to the operator
 - **Stores the complete chain**, because publishing only the first record
   leaves the chain broken
+- Publishes each record into whichever Cloudflare zone owns its name, writing
+  the chain before the anchor so the anchor never dangles
 - Renders the BIND/multi-string form (four tokens per quoted string) for
   records longer than one DNS character-string
 
